@@ -48,6 +48,8 @@ switcheroo-control = { git = "https://github.com/pop-os/dbus-settings-bindings" 
 zbus = { version = "5.13", default-features = false, features = ["tokio"] }
 unicode-truncate = "2.0.1"
 unicode-width = "0.2.2"
+calloop = "0.13.0"
+calloop-wayland-source = "0.3.0"
 # [patch.'https://github.com/pop-os/libcosmic']
 # libcosmic = { path = "../../cosmic/libcosmic" }
 # cosmic-config = { path = "../../cosmic/libcosmic/cosmic-config" }

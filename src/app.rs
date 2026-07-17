@@ -144,6 +144,15 @@ pub enum SurfaceState {
     WaitingToBeShown,
 }
 
+/// A live window thumbnail captured for the alt-tab switcher.
+#[derive(Clone)]
+pub struct ThumbEntry {
+    identifier: String,
+    title: String,
+    app_id: String,
+    image: cosmic::widget::image::Handle,
+}
+
 #[derive(Clone)]
 pub struct CosmicLauncher {
     core: Core,
@@ -151,6 +160,11 @@ pub struct CosmicLauncher {
     surface_state: SurfaceState,
     launcher_items: Vec<SearchResult>,
     launcher_item_icon_handles: Vec<Option<cosmic::widget::icon::Handle>>,
+    /// Live window thumbnails (from the wayland capture backend), keyed by
+    /// toplevel identifier; correlated to launcher items by title/app_id.
+    thumbnails: Vec<ThumbEntry>,
+    /// Channel to tell the capture thread to start/stop capturing.
+    thumb_tx: Option<calloop::channel::Sender<crate::wayland::Cmd>>,
     tx: Option<mpsc::Sender<launcher::Request>>,
     menu: Option<(u32, Vec<ContextOption>)>,
     cursor_position: Option<Point<f32>>,
@@ -189,6 +203,7 @@ pub enum Message {
     AltRelease,
     Overlap(OverlapNotifyEvent),
     Surface(surface::Action),
+    Thumb(crate::wayland::Event),
 }
 
 impl CosmicLauncher {
@@ -228,6 +243,8 @@ impl CosmicLauncher {
         self.alt_tab = false;
         self.queue.clear();
         self.hand_over.clear();
+        self.set_thumbs_active(false);
+        self.thumbnails.clear();
 
         self.request(launcher::Request::Close);
 
@@ -275,6 +292,26 @@ impl CosmicLauncher {
             }
             self.margin = o.y + o.height;
         }
+    }
+
+    /// Tell the capture thread to start/stop capturing window thumbnails.
+    fn set_thumbs_active(&self, active: bool) {
+        if let Some(tx) = &self.thumb_tx {
+            let _ = tx.send(crate::wayland::Cmd::SetActive(active));
+        }
+    }
+
+    /// Find a captured thumbnail matching a launcher item (a window result).
+    /// Correlates by window title, which pop-launcher exposes as either the
+    /// item name or description.
+    fn thumbnail_for(&self, item: &SearchResult) -> Option<&cosmic::widget::image::Handle> {
+        if item.window.is_none() {
+            return None;
+        }
+        self.thumbnails
+            .iter()
+            .find(|t| !t.title.is_empty() && (t.title == item.name || t.title == item.description))
+            .map(|t| &t.image)
     }
 }
 
@@ -327,6 +364,8 @@ impl cosmic::Application for CosmicLauncher {
                 surface_state: SurfaceState::Hidden,
                 launcher_items: Vec::new(),
                 launcher_item_icon_handles: Vec::new(),
+                thumbnails: Vec::new(),
+                thumb_tx: None,
                 tx: None,
                 menu: None,
                 cursor_position: None,
@@ -700,6 +739,35 @@ impl cosmic::Application for CosmicLauncher {
                     cosmic::app::Action::Surface(a),
                 ));
             }
+            Message::Thumb(event) => match event {
+                crate::wayland::Event::Ready(tx) => {
+                    self.thumb_tx = Some(tx);
+                }
+                crate::wayland::Event::Thumbnail {
+                    identifier,
+                    title,
+                    app_id,
+                    image,
+                } => {
+                    if let Some(entry) =
+                        self.thumbnails.iter_mut().find(|t| t.identifier == identifier)
+                    {
+                        entry.title = title;
+                        entry.app_id = app_id;
+                        entry.image = image;
+                    } else {
+                        self.thumbnails.push(ThumbEntry {
+                            identifier,
+                            title,
+                            app_id,
+                            image,
+                        });
+                    }
+                }
+                crate::wayland::Event::Closed(identifier) => {
+                    self.thumbnails.retain(|t| t.identifier != identifier);
+                }
+            },
         }
         Task::none()
     }
@@ -739,6 +807,7 @@ impl cosmic::Application for CosmicLauncher {
                         }
 
                         self.alt_tab = true;
+                        self.set_thumbs_active(true);
                         self.request(launcher::Request::Search(String::new()));
                         self.queue.push_back(Message::AltTab);
                     }
@@ -748,6 +817,7 @@ impl cosmic::Application for CosmicLauncher {
                         }
 
                         self.alt_tab = true;
+                        self.set_thumbs_active(true);
                         self.request(launcher::Request::Search(String::new()));
                         self.queue.push_back(Message::ShiftAltTab);
                     }
@@ -861,7 +931,15 @@ impl cosmic::Application for CosmicLauncher {
                                 .into(),
                         );
                     }
-                    if let Some(Some(icon_handle)) = self.launcher_item_icon_handles.get(i) {
+                    if let Some(thumb) = self.thumbnail_for(item) {
+                        button_content.push(
+                            cosmic::widget::image::Image::new(thumb.clone())
+                                .width(Length::Fixed(160.0))
+                                .height(Length::Fixed(100.0))
+                                .content_fit(cosmic::iced::ContentFit::Contain)
+                                .into(),
+                        );
+                    } else if let Some(Some(icon_handle)) = self.launcher_item_icon_handles.get(i) {
                         button_content.push(
                             icon(icon_handle.clone())
                                 .width(Length::Fixed(32.0))
@@ -1073,6 +1151,7 @@ impl cosmic::Application for CosmicLauncher {
     fn subscription(&self) -> Subscription<Self::Message> {
         Subscription::batch(vec![
             launcher::subscription(0).map(Message::LauncherEvent),
+            crate::wayland::subscription().map(Message::Thumb),
             listen_raw(|e, status, id| match e {
                 cosmic::iced::Event::PlatformSpecific(PlatformSpecific::Wayland(
                     wayland::Event::Layer(e, ..),

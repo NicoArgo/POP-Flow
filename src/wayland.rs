@@ -33,8 +33,8 @@ use cosmic::cctk::wayland_client::{
 };
 use cosmic::cctk::wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use cosmic::iced::futures::executor::block_on;
-use cosmic::iced::futures::{FutureExt, SinkExt};
 use cosmic::iced::futures::channel::mpsc;
+use cosmic::iced::futures::{SinkExt, StreamExt};
 use cosmic::widget::image;
 
 /// Events streamed from the capture thread up to the iced app.
@@ -83,9 +83,20 @@ pub enum Cmd {
 
 /// The iced subscription that owns the capture thread for the app's lifetime.
 pub fn subscription() -> cosmic::iced::Subscription<Event> {
-    cosmic::iced::Subscription::run_with("cosmic-launcher-thumbnails", |_id| {
-        async { start(Connection::connect_to_env().unwrap()) }.flatten_stream()
-    })
+    cosmic::iced::Subscription::run_with_id(
+        "cosmic-launcher-thumbnails",
+        cosmic::iced_futures::stream::channel(20, |mut output| async move {
+            let Ok(conn) = Connection::connect_to_env() else {
+                tracing::warn!("thumbnail backend: no wayland connection");
+                std::future::pending::<()>().await;
+                unreachable!();
+            };
+            let mut receiver = start(conn);
+            while let Some(event) = receiver.next().await {
+                let _ = output.send(event).await;
+            }
+        }),
+    )
 }
 
 struct AppData {

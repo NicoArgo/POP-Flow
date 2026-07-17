@@ -1261,6 +1261,8 @@ dependencies = [
 name = "cosmic-launcher"
 version = "1.0.3"
 dependencies = [
+ "calloop 0.13.0",
+ "calloop-wayland-source 0.3.0",
  "clap",
  "console-subscriber",
  "futures",
