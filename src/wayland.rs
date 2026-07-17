@@ -248,10 +248,11 @@ impl ScreencopyHandler for AppData {
             return;
         };
         let (width, height) = data.size;
-        let pixels = {
+        let mut pixels = {
             let mut pool = data.pool.lock().unwrap();
             pool.mmap().to_vec()
         };
+        round_corners(&mut pixels, width, height);
         let handle = image::Handle::from_rgba(width, height, pixels);
         self.send_event(Event::Thumbnail {
             identifier: data.identifier.clone(),
@@ -422,6 +423,49 @@ fn start(conn: Connection) -> mpsc::Receiver<Event> {
     });
 
     receiver
+}
+
+/// Apply rounded corners to an RGBA image in place by zeroing the alpha of
+/// pixels outside a rounded rectangle (with 1px anti-aliasing). The radius is
+/// proportional to the image size so it looks consistent once scaled down.
+fn round_corners(pixels: &mut [u8], w: u32, h: u32) {
+    let wi = w as i64;
+    let hi = h as i64;
+    let r = ((w.min(h) as f32) * 0.05).round() as i64;
+    if r < 2 || pixels.len() < (wi * hi * 4) as usize {
+        return;
+    }
+    let rf = r as f32;
+    // (box origin x, box origin y, arc center x, arc center y)
+    let corners = [
+        (0i64, 0i64, rf, rf),
+        (wi - r, 0, (wi - r) as f32, rf),
+        (0, hi - r, rf, (hi - r) as f32),
+        (wi - r, hi - r, (wi - r) as f32, (hi - r) as f32),
+    ];
+    for (bx, by, cx, cy) in corners {
+        for yy in by..(by + r) {
+            for xx in bx..(bx + r) {
+                if xx < 0 || yy < 0 || xx >= wi || yy >= hi {
+                    continue;
+                }
+                let dx = xx as f32 - cx;
+                let dy = yy as f32 - cy;
+                let dist = (dx * dx + dy * dy).sqrt();
+                let factor = if dist <= rf - 1.0 {
+                    1.0
+                } else if dist >= rf {
+                    0.0
+                } else {
+                    rf - dist
+                };
+                if factor < 1.0 {
+                    let idx = ((yy * wi + xx) * 4 + 3) as usize;
+                    pixels[idx] = (pixels[idx] as f32 * factor) as u8;
+                }
+            }
+        }
+    }
 }
 
 sctk::delegate_registry!(AppData);

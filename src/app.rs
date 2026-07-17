@@ -165,6 +165,8 @@ pub struct CosmicLauncher {
     thumbnails: Vec<ThumbEntry>,
     /// Channel to tell the capture thread to start/stop capturing.
     thumb_tx: Option<calloop::channel::Sender<crate::wayland::Cmd>>,
+    /// Index of the alt-tab cell currently hovered by the pointer, if any.
+    hovered: Option<usize>,
     tx: Option<mpsc::Sender<launcher::Request>>,
     menu: Option<(u32, Vec<ContextOption>)>,
     cursor_position: Option<Point<f32>>,
@@ -204,6 +206,8 @@ pub enum Message {
     Overlap(OverlapNotifyEvent),
     Surface(surface::Action),
     Thumb(crate::wayland::Event),
+    Hover(usize),
+    Unhover,
 }
 
 impl CosmicLauncher {
@@ -229,7 +233,7 @@ impl CosmicLauncher {
                 anchor: Anchor::TOP,
                 namespace: "launcher".into(),
                 size: None,
-                size_limits: Limits::NONE.min_width(1.0).min_height(1.0).max_width(600.0),
+                size_limits: Limits::NONE.min_width(1.0).min_height(1.0).max_width(720.0),
                 exclusive_zone: -1,
                 ..Default::default()
             }),
@@ -302,17 +306,205 @@ impl CosmicLauncher {
     }
 
     /// Find a captured thumbnail matching a launcher item (a window result).
-    /// Correlates by window title, which pop-launcher exposes as either the
-    /// item name or description.
+    /// Correlates by window title. pop-launcher exposes the real window title
+    /// as either the item name or description, and terminal titles carry an
+    /// animated spinner glyph, so titles are normalized before comparing.
     fn thumbnail_for(&self, item: &SearchResult) -> Option<&cosmic::widget::image::Handle> {
         if item.window.is_none() {
             return None;
         }
+        let a = norm_title(&item.description);
+        let b = norm_title(&item.name);
         self.thumbnails
             .iter()
-            .find(|t| !t.title.is_empty() && (t.title == item.name || t.title == item.description))
+            .find(|t| {
+                let tt = norm_title(&t.title);
+                !tt.is_empty() && (tt == a || tt == b)
+            })
             .map(|t| &t.image)
     }
+
+    /// The real window title for a launcher item (for the hover label).
+    fn window_title(item: &SearchResult) -> &str {
+        let raw = if item.window.is_some() {
+            &item.description
+        } else {
+            &item.name
+        };
+        raw.lines().next().unwrap_or("")
+    }
+
+    /// The Windows-style thumbnail grid shown while alt-tab is active.
+    fn alt_tab_view(&self) -> Element<'_, Message> {
+        const THUMB_W: f32 = 264.0;
+        const THUMB_H: f32 = 156.0;
+
+        let cells: Vec<Element<Message>> = self
+            .launcher_items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let is_focused = i == self.focused;
+                let revealed = is_focused || self.hovered == Some(i);
+
+                // Live thumbnail, or icon fallback while it loads / if unmatched.
+                let media: Element<Message> = if let Some(handle) = self.thumbnail_for(item) {
+                    cosmic::widget::image::Image::new(handle.clone())
+                        .width(Length::Fixed(THUMB_W))
+                        .height(Length::Fixed(THUMB_H))
+                        .content_fit(cosmic::iced::ContentFit::Contain)
+                        .into()
+                } else if let Some(Some(icon_handle)) = self.launcher_item_icon_handles.get(i) {
+                    container(
+                        icon(icon_handle.clone())
+                            .width(Length::Fixed(56.0))
+                            .height(Length::Fixed(56.0)),
+                    )
+                    .center_x(Length::Fixed(THUMB_W))
+                    .center_y(Length::Fixed(THUMB_H))
+                    .into()
+                } else {
+                    container(vertical_space().height(Length::Fixed(THUMB_H)))
+                        .width(Length::Fixed(THUMB_W))
+                        .height(Length::Fixed(THUMB_H))
+                        .into()
+                };
+
+                // Window name — hidden until this cell is focused or hovered.
+                let title = Self::window_title(item);
+                let title = if title.width() > 40 {
+                    format!("{}…", title.unicode_truncate(40).0)
+                } else {
+                    title.to_string()
+                };
+                let label: Element<Message> = if revealed {
+                    container(text::caption(title).class(theme::Text::Custom(|t| {
+                        cosmic::iced::widget::text::Style {
+                            color: Some(t.cosmic().on_bg_color().into()),
+                        }
+                    })))
+                    .width(Length::Fixed(THUMB_W))
+                    .align_x(Horizontal::Center)
+                    .padding([2, 4])
+                    .into()
+                } else {
+                    vertical_space().height(Length::Fixed(0.0)).into()
+                };
+
+                let cell = column![media, label].spacing(6).align_x(Alignment::Center);
+
+                let btn = cosmic::widget::button::custom(cell)
+                    .id(self.result_ids[i].clone())
+                    .on_press(Message::Activate(Some(i)))
+                    .padding(6)
+                    .class(Button::Custom {
+                        active: Box::new(move |focused, theme| {
+                            let focused = is_focused || focused;
+                            let rad = theme.cosmic().corner_radii.radius_m;
+                            let a = if focused {
+                                button::Catalog::hovered(theme, focused, focused, &Button::Text)
+                            } else {
+                                button::Catalog::active(theme, focused, focused, &Button::Text)
+                            };
+                            button::Style {
+                                border_radius: rad.into(),
+                                outline_width: 0.0,
+                                ..a
+                            }
+                        }),
+                        hovered: Box::new(move |_focused, theme| {
+                            let rad = theme.cosmic().corner_radii.radius_m;
+                            let a = button::Catalog::hovered(theme, true, true, &Button::Text);
+                            button::Style {
+                                border_radius: rad.into(),
+                                outline_width: 0.0,
+                                ..a
+                            }
+                        }),
+                        disabled: Box::new(|theme| {
+                            let rad = theme.cosmic().corner_radii.radius_m;
+                            let a = button::Catalog::disabled(theme, &Button::Text);
+                            button::Style {
+                                border_radius: rad.into(),
+                                outline_width: 0.0,
+                                ..a
+                            }
+                        }),
+                        pressed: Box::new(move |_focused, theme| {
+                            let rad = theme.cosmic().corner_radii.radius_m;
+                            let a = button::Catalog::pressed(theme, true, true, &Button::Text);
+                            button::Style {
+                                border_radius: rad.into(),
+                                outline_width: 0.0,
+                                ..a
+                            }
+                        }),
+                    });
+
+                mouse_area(btn)
+                    .on_enter(Message::Hover(i))
+                    .on_exit(Message::Unhover)
+                    .on_right_release(Message::Context(i))
+                    .into()
+            })
+            .collect();
+
+        // Lay cells out two per row.
+        let mut grid = Column::new().spacing(8);
+        let mut iter = cells.into_iter();
+        while let Some(a) = iter.next() {
+            if let Some(b) = iter.next() {
+                grid = grid.push(row![a, b].spacing(8));
+            } else {
+                grid = grid
+                    .push(row![a, horizontal_space().width(Length::Fixed(THUMB_W + 12.0))].spacing(8));
+            }
+        }
+
+        let body: Element<Message> = if self.launcher_items.len() > 8 {
+            container(scrollable(grid).id(SCROLLABLE.clone()))
+                .max_height(600)
+                .into()
+        } else {
+            grid.into()
+        };
+
+        let window = Column::new()
+            .push(vertical_space().height(Length::Fixed(self.margin + 16.)))
+            .push(
+                container(id_container(body, MAIN_ID.clone()))
+                    .width(Length::Shrink)
+                    .height(Length::Shrink)
+                    .class(Container::Custom(Box::new(|theme| {
+                        let t = theme.cosmic();
+                        let radii = t.radius_s().map(|x| if x < 4.0 { x } else { x + 4.0 });
+                        container::Style {
+                            text_color: Some(t.on_bg_color().into()),
+                            icon_color: Some(t.on_bg_color().into()),
+                            background: Some(Color::from(t.background.base).into()),
+                            border: Border {
+                                radius: radii.into(),
+                                width: 1.0,
+                                color: t.bg_divider().into(),
+                            },
+                            shadow: Shadow::default(),
+                        }
+                    })))
+                    .padding(16),
+            );
+
+        Element::from(autosize::autosize(window, AUTOSIZE_ID.clone()))
+    }
+}
+
+/// Normalize a window title for correlation: drop leading non-alphanumeric
+/// glyphs (e.g. the terminal's animated braille spinner) and surrounding
+/// whitespace so that titles from different sources/instants still match.
+fn norm_title(s: &str) -> String {
+    s.trim()
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim()
+        .to_string()
 }
 
 async fn launch(
@@ -366,6 +558,7 @@ impl cosmic::Application for CosmicLauncher {
                 launcher_item_icon_handles: Vec::new(),
                 thumbnails: Vec::new(),
                 thumb_tx: None,
+                hovered: None,
                 tx: None,
                 menu: None,
                 cursor_position: None,
@@ -768,6 +961,12 @@ impl cosmic::Application for CosmicLauncher {
                     self.thumbnails.retain(|t| t.identifier != identifier);
                 }
             },
+            Message::Hover(i) => {
+                self.hovered = Some(i);
+            }
+            Message::Unhover => {
+                self.hovered = None;
+            }
         }
         Task::none()
     }
@@ -844,6 +1043,9 @@ impl cosmic::Application for CosmicLauncher {
     #[allow(clippy::too_many_lines)]
     fn view_window(&self, id: SurfaceId) -> Element<'_, Self::Message> {
         if id == self.window_id {
+            if self.alt_tab {
+                return self.alt_tab_view();
+            }
             let launcher_entry = text_input::search_input(fl!("type-to-search"), &self.input_value)
                 .on_input(Message::InputChanged)
                 .on_paste(Message::InputChanged)
