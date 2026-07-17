@@ -1,48 +1,79 @@
-# Cosmic Launcher
+# POP Flow
 
-Layer Shell frontend for https://github.com/pop-os/launcher. Currently the underlying protocol being used in the plugin for managing toplevels in wayland is defined [here](https://github.com/pop-os/cosmic-protocols/blob/main/unstable/cosmic-toplevel-info-unstable-v1.xml) but it will be switched to use [wlr-foreign-toplevel-management](https://wayland.app/protocols/wlr-foreign-toplevel-management-unstable-v1) when it is ready.
+**A Windows-style Alt-Tab window switcher with live thumbnails for Pop!_OS COSMIC.**
 
-# Building
+COSMIC's stock Alt-Tab is a text list. POP Flow replaces it with a grid of **live
+window previews** — like the Windows Alt-Tab — so you can see what you're switching to.
 
-Cosmic Launcher is set up to build a deb and a Nix flake, but it can be built using just.
+POP Flow is a small patch on top of System76's
+[`cosmic-launcher`](https://github.com/pop-os/cosmic-launcher) (the program COSMIC
+already invokes as `cosmic-launcher alt-tab`). Nothing else in your desktop is
+touched — the compositor is left completely alone.
 
-Some Build Dependencies:
+## Features
+
+- 🖼️ **Live window thumbnails** captured through the Wayland `ext-image-copy-capture`
+  (screencopy) protocol — the real contents of each window, updated when the
+  switcher opens.
+- ▦ **Two-column grid** layout, thumbnail-first.
+- 🔲 **Rounded thumbnail corners** (anti-aliased alpha mask).
+- 🏷️ **Clean by default** — the window title is hidden and only appears on the
+  **selected** or **hovered** thumbnail.
+- 🪶 Capturing only runs **while the switcher is open**, so there's no idle cost.
+
+> Screenshot: _add your own — the switcher renders whatever windows you have open._
+
+## How it works
+
+- `src/wayland.rs` — a dedicated Wayland thread that lists open toplevels
+  (`ext-foreign-toplevel-list` + cosmic toplevel-info) and captures each one to an
+  `image::Handle` via screencopy. It is gated by a command channel so it only
+  captures while Alt-Tab is on screen.
+- `src/app.rs` — stores the thumbnails, correlates them to the switcher entries by
+  window title (normalizing the terminal's animated spinner glyph), and renders the
+  grid in `alt_tab_view`.
+
+No new system dependencies and **no libcosmic bump** were needed — the screencopy
+and toplevel-info APIs are already available through the `cosmic-client-toolkit`
+that `cosmic-launcher` ships with.
+
+## Requirements
+
+- Pop!_OS 24.04 (COSMIC) or another COSMIC session on Wayland.
+- Rust toolchain (`rustup`).
+- Build dependencies:
+
+  ```bash
+  sudo apt install -y libxkbcommon-dev libwayland-dev pkg-config
+  ```
+
+## Install
+
+```bash
+git clone https://github.com/NicoArgo/POP-Flow.git
+cd POP-Flow
+./install.sh
 ```
-  cargo,
-  just,
-  intltool,
-  appstream-util,
-  desktop-file-utils,
-  libxkbcommon-dev,
-  pkg-config,
-  desktop-file-utils,
+
+`install.sh` builds a release binary, backs up your current
+`/usr/bin/cosmic-launcher` to `./cosmic-launcher.orig`, installs the patched
+binary, and restarts the launcher. Then just press **Alt+Tab**.
+
+## Uninstall
+
+```bash
+./uninstall.sh
 ```
 
-## Build Commands
+Restores the original binary from the backup.
 
-For a typical install from source, use `just` followed with `sudo just install`.
-```sh
-just
-sudo just install
-```
+> Note: a system update to the `cosmic-launcher` package will overwrite the patched
+> binary with the stock one. Just run `./install.sh` again to reapply.
 
-If you are packaging, run `just vendor` outside of your build chroot, then use `just build-vendored` inside the build-chroot. Then you can specify a custom root directory and prefix.
-```sh
-# Outside build chroot
-just clean-dist
-just vendor
+## Credits & License
 
-# Inside build chroot
-just build-vendored
-sudo just rootdir=debian/cosmic-launcher prefix=/usr install
-```
+POP Flow is a derivative work of
+[`pop-os/cosmic-launcher`](https://github.com/pop-os/cosmic-launcher) by System76.
+The original project README is preserved as [`README.upstream.md`](./README.upstream.md).
 
-# Translators
-
-Translation files may be found in the i18n directory. New translations may copy the English (en) localization of the project and rename `en` to the desired [ISO 639-1 language code](https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes). Translations may be submitted through GitHub as an issue or pull request. Submissions by email or other means are also acceptable; with the preferred name and email to associate with the changes.
-
-# Debugging & Profiling
-
-## Profiling async tasks with tokio-console
-
-To debug issues with asynchronous code, install [tokio-console](https://github.com/tokio-rs/console) and run it within a separate terminal. Then kill the **cosmic-launcher** process a couple times in quick succession to prevent **cosmic-session** from spawning it again. Then you can start **cosmic-launcher** with **tokio-console** support either by running `just tokio-console` from this repository to test code changes, or `env TOKIO_CONSOLE=1 cosmic-launcher` to enable it with the installed version of **cosmic-launcher**.
+Licensed under the **GNU General Public License v3.0** — see [`LICENSE.md`](./LICENSE.md).

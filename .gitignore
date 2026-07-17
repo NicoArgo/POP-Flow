@@ -23,3 +23,4 @@ debian/*
 !debian/links
 !debian/rules
 !debian/source
+cosmic-launcher.orig
