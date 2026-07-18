@@ -18,5 +18,11 @@ fi
 echo "==> Installing to /usr/bin/cosmic-launcher (needs sudo)..."
 sudo install -m 0755 "$BIN" /usr/bin/cosmic-launcher
 
+# Keep the auto-reapply golden copy in sync when a rebuild is installed.
+if [ -f /usr/local/lib/pop-flow/cosmic-launcher ]; then
+    echo "==> Refreshing auto-reapply golden copy"
+    sudo install -m 0755 "$BIN" /usr/local/lib/pop-flow/cosmic-launcher
+fi
+
 pkill -x cosmic-launcher 2>/dev/null || true
 echo "==> Done. Open a few windows and press Alt+Tab."

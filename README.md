@@ -62,16 +62,30 @@ cd POP-Flow
 `/usr/bin/cosmic-launcher` to `./cosmic-launcher.orig`, installs the patched
 binary, and restarts the launcher. Then just press **Alt+Tab**.
 
+## Survive system updates (optional)
+
+A `cosmic-launcher` package update overwrites the patched binary with the stock
+one. To reapply POP Flow automatically:
+
+```bash
+./setup-auto-reapply.sh   # one-time, needs sudo
+```
+
+This installs an APT/dpkg post-invoke hook that, after any package operation,
+reinstalls POP Flow (from a root-owned "golden" copy in `/usr/local/lib/pop-flow`)
+whenever `/usr/bin/cosmic-launcher` no longer matches it. The hook is guarded so
+it can never break `apt`. Turn it off with `./remove-auto-reapply.sh`.
+
+Without it, just run `./install.sh` again after an update.
+
 ## Uninstall
 
 ```bash
 ./uninstall.sh
 ```
 
-Restores the original binary from the backup.
-
-> Note: a system update to the `cosmic-launcher` package will overwrite the patched
-> binary with the stock one. Just run `./install.sh` again to reapply.
+Restores the original binary from the backup (and removes the auto-reapply hook
+if it was set up).
 
 ## Credits & License
 
