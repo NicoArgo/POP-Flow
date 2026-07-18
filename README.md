@@ -12,9 +12,9 @@ touched — the compositor is left completely alone.
 
 ## Features
 
-- 🖼️ **Live window thumbnails** captured through the Wayland `ext-image-copy-capture`
-  (screencopy) protocol — the real contents of each window, updated when the
-  switcher opens.
+- 🖼️ **Window thumbnails** captured through the Wayland `ext-image-copy-capture`
+  (screencopy) protocol — the real contents of each window, snapshotted (and
+  downscaled) each time the switcher opens.
 - ▦ **Two-column grid** layout, thumbnail-first.
 - 🔲 **Rounded thumbnail corners** (anti-aliased alpha mask).
 - 🏷️ **Clean by default** — the window title is hidden and only appears on the

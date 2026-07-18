@@ -1,10 +1,11 @@
-// Live window-thumbnail capture backend for the alt-tab switcher.
+// Window-thumbnail capture backend for the alt-tab switcher.
 //
 // Runs a dedicated wayland connection on its own thread. It enumerates open
-// toplevels via `ext-foreign-toplevel-list` / cosmic toplevel-info, and — while
-// the switcher is active — captures a live image of each window through the
-// `ext-image-copy-capture` (screencopy) protocol, streaming the results back to
-// the iced app as a `Subscription`.
+// toplevels via `ext-foreign-toplevel-list` / cosmic toplevel-info, and — when
+// the switcher opens — captures a single snapshot of each window through the
+// `ext-image-copy-capture` (screencopy) protocol, then delivers the results to
+// the iced app over a `Subscription`. Snapshots are taken once per switcher
+// open (not continuously), and downscaled before hand-off to keep memory small.
 //
 // The heavy lifting (protocol handlers, buffer allocation) mirrors the cctk
 // `screenshot-screencopy` example and cosmic-workspaces, adapted to a
@@ -34,7 +35,6 @@ use cosmic::cctk::wayland_client::{
     Connection, QueueHandle, WEnum,
 };
 use cosmic::cctk::wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
-use cosmic::iced::futures::executor::block_on;
 use cosmic::iced::futures::channel::mpsc;
 use cosmic::iced::futures::{SinkExt, StreamExt};
 use cosmic::widget::image;
@@ -53,6 +53,9 @@ pub enum Event {
     },
     /// A toplevel went away.
     Closed(String),
+    /// Whether the compositor's toplevel-management protocol is present and
+    /// advertises the `Close` capability. Gates the close (X) affordance.
+    CloseSupported(bool),
 }
 
 impl std::fmt::Debug for Event {
@@ -71,6 +74,9 @@ impl std::fmt::Debug for Event {
                 .field("app_id", app_id)
                 .finish_non_exhaustive(),
             Event::Closed(id) => f.debug_tuple("Event::Closed").field(id).finish(),
+            Event::CloseSupported(v) => {
+                f.debug_tuple("Event::CloseSupported").field(v).finish()
+            }
         }
     }
 }
@@ -115,7 +121,7 @@ struct AppData {
     /// Cosmic toplevel-management global, used to close windows. `None` if the
     /// compositor doesn't advertise the protocol.
     toplevel_manager_state: Option<ToplevelManagerState>,
-    sender: mpsc::Sender<Event>,
+    sender: mpsc::UnboundedSender<Event>,
     active: bool,
     /// identifier -> live capture session (kept alive so it isn't dropped).
     sessions: HashMap<String, CaptureSession>,
@@ -123,7 +129,9 @@ struct AppData {
 
 impl AppData {
     fn send_event(&mut self, event: Event) {
-        let _ = block_on(self.sender.send(event));
+        // Unbounded + synchronous: never blocks the wayland event loop, so
+        // slow drains on the app side can't stall capture/command dispatch.
+        let _ = self.sender.unbounded_send(event);
     }
 
     fn handle_cmd(&mut self, cmd: Cmd) {
@@ -278,10 +286,13 @@ impl ScreencopyHandler for AppData {
             return;
         };
         let (width, height) = data.size;
-        let mut pixels = {
+        let pixels = {
             let mut pool = data.pool.lock().unwrap();
             pool.mmap().to_vec()
         };
+        // Downscale to display resolution before building the handle: a full 4K
+        // window is ~34 MB of RGBA, and we only ever draw it at ~264×156.
+        let (mut pixels, width, height) = downscale_rgba(pixels, width, height, THUMB_MAX_DIM);
         round_corners(&mut pixels, width, height);
         let handle = image::Handle::from_rgba(width, height, pixels);
         self.send_event(Event::Thumbnail {
@@ -366,10 +377,15 @@ impl ToplevelManagerHandler for AppData {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _capabilities: Vec<
+        capabilities: Vec<
             WEnum<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>,
         >,
     ) {
+        use zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1 as Cap;
+        let can_close = capabilities
+            .iter()
+            .any(|c| matches!(c, WEnum::Value(Cap::Close)));
+        self.send_event(Event::CloseSupported(can_close));
     }
 }
 
@@ -425,18 +441,33 @@ impl ScreencopyFrameDataExt for FrameData {
     }
 }
 
-fn start(conn: Connection) -> mpsc::Receiver<Event> {
-    let (sender, receiver) = mpsc::channel(20);
+fn start(conn: Connection) -> mpsc::UnboundedReceiver<Event> {
+    let (sender, receiver) = mpsc::unbounded();
 
-    let (globals, event_queue) = registry_queue_init(&conn).unwrap();
+    let (globals, event_queue) = match registry_queue_init(&conn) {
+        Ok(v) => v,
+        Err(err) => {
+            // Dropping `sender` closes the stream; the app runs on without
+            // thumbnails instead of the capture thread panicking.
+            tracing::error!("thumbnail backend: registry init failed: {err}");
+            return receiver;
+        }
+    };
     let qh = event_queue.handle();
 
     thread::spawn(move || {
         let registry_state = RegistryState::new(&globals);
+        let shm_state = match Shm::bind(&globals, &qh) {
+            Ok(shm) => shm,
+            Err(err) => {
+                tracing::error!("thumbnail backend: wl_shm unavailable: {err}");
+                return;
+            }
+        };
         let mut app_data = AppData {
             qh: qh.clone(),
             output_state: OutputState::new(&globals, &qh),
-            shm_state: Shm::bind(&globals, &qh).unwrap(),
+            shm_state,
             screencopy_state: ScreencopyState::new(&globals, &qh),
             toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
             toplevel_manager_state: ToplevelManagerState::try_new(&registry_state, &qh),
@@ -470,6 +501,58 @@ fn start(conn: Connection) -> mpsc::Receiver<Event> {
     });
 
     receiver
+}
+
+/// Longest-side cap for stored thumbnails. The switcher draws them at ~264×156,
+/// so ~2× that is ample for HiDPI while keeping each handle a few hundred KB
+/// instead of tens of MB.
+const THUMB_MAX_DIM: u32 = 512;
+
+/// Box-average downscale of an RGBA buffer so its longest side is at most
+/// `max_dim`, returning the input untouched when it already fits. Keeps the
+/// capture pipeline dependency-free (no `image` crate) and cheap: it runs once
+/// per snapshot on the capture thread.
+fn downscale_rgba(src: Vec<u8>, w: u32, h: u32, max_dim: u32) -> (Vec<u8>, u32, u32) {
+    let longest = w.max(h);
+    if longest <= max_dim || w == 0 || h == 0 || src.len() < w as usize * h as usize * 4 {
+        return (src, w, h);
+    }
+    let scale = max_dim as f32 / longest as f32;
+    let tw = ((w as f32 * scale).round() as u32).max(1);
+    let th = ((h as f32 * scale).round() as u32).max(1);
+    let mut dst = vec![0u8; tw as usize * th as usize * 4];
+    for ty in 0..th {
+        let sy0 = (u64::from(ty) * u64::from(h) / u64::from(th)) as u32;
+        let sy1 = ((u64::from(ty + 1) * u64::from(h) / u64::from(th)) as u32)
+            .max(sy0 + 1)
+            .min(h);
+        for tx in 0..tw {
+            let sx0 = (u64::from(tx) * u64::from(w) / u64::from(tw)) as u32;
+            let sx1 = ((u64::from(tx + 1) * u64::from(w) / u64::from(tw)) as u32)
+                .max(sx0 + 1)
+                .min(w);
+            let (mut r, mut g, mut b, mut a, mut count) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            for sy in sy0..sy1 {
+                let row = sy as usize * w as usize;
+                for sx in sx0..sx1 {
+                    let i = (row + sx as usize) * 4;
+                    r += u32::from(src[i]);
+                    g += u32::from(src[i + 1]);
+                    b += u32::from(src[i + 2]);
+                    a += u32::from(src[i + 3]);
+                    count += 1;
+                }
+            }
+            let di = (ty as usize * tw as usize + tx as usize) * 4;
+            if count > 0 {
+                dst[di] = (r / count) as u8;
+                dst[di + 1] = (g / count) as u8;
+                dst[di + 2] = (b / count) as u8;
+                dst[di + 3] = (a / count) as u8;
+            }
+        }
+    }
+    (dst, tw, th)
 }
 
 /// Apply rounded corners to an RGBA image in place by zeroing the alpha of

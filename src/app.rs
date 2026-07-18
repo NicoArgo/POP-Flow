@@ -165,6 +165,9 @@ pub struct CosmicLauncher {
     thumbnails: Vec<ThumbEntry>,
     /// Channel to tell the capture thread to start/stop capturing.
     thumb_tx: Option<calloop::channel::Sender<crate::wayland::Cmd>>,
+    /// Whether the compositor lets us close windows (toplevel-management with the
+    /// `Close` capability). Gates the close (X) affordance in the switcher.
+    close_supported: bool,
     /// Index of the alt-tab cell currently hovered by the pointer, if any.
     hovered: Option<usize>,
     tx: Option<mpsc::Sender<launcher::Request>>,
@@ -310,20 +313,38 @@ impl CosmicLauncher {
     /// Correlates by window title. pop-launcher exposes the real window title
     /// as either the item name or description, and terminal titles carry an
     /// animated spinner glyph, so titles are normalized before comparing.
-    fn thumbnail_entry_for(&self, item: &SearchResult) -> Option<&ThumbEntry> {
+    /// All captured thumbnails whose normalized window title matches this
+    /// launcher item. When several windows share a title this returns them all;
+    /// callers decide whether that is safe to act on.
+    fn matching_thumbs(&self, item: &SearchResult) -> Vec<&ThumbEntry> {
         if item.window.is_none() {
-            return None;
+            return Vec::new();
         }
         let a = norm_title(&item.description);
         let b = norm_title(&item.name);
-        self.thumbnails.iter().find(|t| {
-            let tt = norm_title(&t.title);
-            !tt.is_empty() && (tt == a || tt == b)
-        })
+        self.thumbnails
+            .iter()
+            .filter(|t| {
+                let tt = norm_title(&t.title);
+                !tt.is_empty() && (tt == a || tt == b)
+            })
+            .collect()
     }
 
+    /// A representative thumbnail image to show for an item (first title match).
     fn thumbnail_for(&self, item: &SearchResult) -> Option<&cosmic::widget::image::Handle> {
-        self.thumbnail_entry_for(item).map(|t| &t.image)
+        self.matching_thumbs(item)
+            .into_iter()
+            .next()
+            .map(|t| &t.image)
+    }
+
+    /// The toplevel identifier to close for this item, or `None` when it can't be
+    /// pinned to a single window — closing an ambiguous title risks killing the
+    /// wrong window, so we refuse. Same-title matches are narrowed by app id.
+    fn close_target_for(&self, item: &SearchResult) -> Option<String> {
+        let candidates = self.matching_thumbs(item);
+        pick_close_target(item, &candidates).map(|t| t.identifier.clone())
     }
 
     /// The real window title for a launcher item (for the hover label).
@@ -373,16 +394,22 @@ impl CosmicLauncher {
                 };
 
                 // Windows-style close (X) in the thumbnail's top-right corner,
-                // revealed on hover/focus. Only shown when we have a live window
-                // to close (a matched toplevel), so the click always has a target.
-                let media: Element<Message> = if revealed && self.thumbnail_entry_for(item).is_some()
+                // revealed on hover/focus. Only shown when the compositor lets us
+                // close windows AND the item maps to a single, unambiguous window
+                // — so the click never risks closing the wrong one.
+                let media: Element<Message> = if revealed
+                    && self.close_supported
+                    && self.close_target_for(item).is_some()
                 {
-                    let close = container(
-                        button::custom(icon::from_name("window-close-symbolic").size(16))
-                            .class(Button::Destructive)
-                            .padding(4)
-                            .on_press(Message::CloseWindow(i)),
-                    )
+                    let x_button = button::custom(icon::from_name("window-close-symbolic").size(16))
+                        .class(Button::Destructive)
+                        .padding(4)
+                        .on_press(Message::CloseWindow(i));
+                    let close = container(cosmic::widget::tooltip(
+                        x_button,
+                        text::body("Close window"),
+                        cosmic::widget::tooltip::Position::Top,
+                    ))
                     .width(Length::Fixed(THUMB_W))
                     .height(Length::Fixed(THUMB_H))
                     .align_x(Horizontal::Right)
@@ -536,6 +563,51 @@ fn norm_title(s: &str) -> String {
         .to_string()
 }
 
+/// Best-effort app identity for a launcher item, taken from its icon name
+/// (usually the desktop/app id): lowercased basename without a `.desktop` suffix.
+fn item_app_hint(item: &SearchResult) -> Option<String> {
+    let IconSource::Name(name) = item.icon.as_ref()? else {
+        return None;
+    };
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let base = base.strip_suffix(".desktop").unwrap_or(base).trim();
+    (!base.is_empty()).then(|| base.to_lowercase())
+}
+
+/// Loose match between a toplevel `app_id` and an item's app hint — they often
+/// differ in casing / reverse-DNS form (e.g. `org.mozilla.firefox` vs `firefox`).
+fn app_id_matches(app_id: &str, hint: &str) -> bool {
+    let a = app_id.to_lowercase();
+    let last = a.rsplit('.').next().unwrap_or(a.as_str());
+    a == hint || last == hint || a.contains(hint) || hint.contains(last)
+}
+
+/// From the thumbnails whose title matches an item, pick the single one that is
+/// safe to close: exactly one match, or — when several share the title — the sole
+/// one whose app id matches the item. `None` means "ambiguous, don't close".
+fn pick_close_target<'a>(
+    item: &SearchResult,
+    candidates: &[&'a ThumbEntry],
+) -> Option<&'a ThumbEntry> {
+    if let [only] = candidates {
+        return Some(*only);
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    let hint = item_app_hint(item)?;
+    let narrowed: Vec<&ThumbEntry> = candidates
+        .iter()
+        .copied()
+        .filter(|t| app_id_matches(&t.app_id, &hint))
+        .collect();
+    if let [only] = narrowed.as_slice() {
+        Some(*only)
+    } else {
+        None
+    }
+}
+
 async fn launch(
     token: Option<String>,
     app_id: String,
@@ -587,6 +659,7 @@ impl cosmic::Application for CosmicLauncher {
                 launcher_item_icon_handles: Vec::new(),
                 thumbnails: Vec::new(),
                 thumb_tx: None,
+                close_supported: false,
                 hovered: None,
                 tx: None,
                 menu: None,
@@ -778,6 +851,12 @@ impl cosmic::Application for CosmicLauncher {
                             a.cmp(&b)
                         });
                         self.launcher_items.splice(.., list);
+                        // Keep the focused index in range when the list shrinks
+                        // (e.g. after a window closes) so nothing points past the
+                        // end.
+                        if self.focused >= self.launcher_items.len() {
+                            self.focused = self.launcher_items.len().saturating_sub(1);
+                        }
                         if self.result_ids.len() < self.launcher_items.len() {
                             self.result_ids.extend(
                                 (self.result_ids.len()..self.launcher_items.len())
@@ -989,6 +1068,9 @@ impl cosmic::Application for CosmicLauncher {
                 crate::wayland::Event::Closed(identifier) => {
                     self.thumbnails.retain(|t| t.identifier != identifier);
                 }
+                crate::wayland::Event::CloseSupported(supported) => {
+                    self.close_supported = supported;
+                }
             },
             Message::Hover(i) => {
                 self.hovered = Some(i);
@@ -997,13 +1079,38 @@ impl cosmic::Application for CosmicLauncher {
                 self.hovered = None;
             }
             Message::CloseWindow(i) => {
+                // Resolve to a single unambiguous window; refuse otherwise so we
+                // never close the wrong one (see `close_target_for`).
                 let identifier = self
                     .launcher_items
                     .get(i)
-                    .and_then(|item| self.thumbnail_entry_for(item))
-                    .map(|t| t.identifier.clone());
-                if let (Some(identifier), Some(tx)) = (identifier, &self.thumb_tx) {
-                    let _ = tx.send(crate::wayland::Cmd::Close(identifier));
+                    .and_then(|item| self.close_target_for(item));
+                let Some(identifier) = identifier else {
+                    return Task::none();
+                };
+                let sent = if let Some(tx) = &self.thumb_tx {
+                    tx.send(crate::wayland::Cmd::Close(identifier)).is_ok()
+                } else {
+                    false
+                };
+                if !sent {
+                    return Task::none();
+                }
+                // Optimistically drop the entry so the grid updates immediately;
+                // the thumbnail is cleared later via `Event::Closed` and
+                // pop-launcher refreshes the list.
+                if i < self.launcher_items.len() {
+                    self.launcher_items.remove(i);
+                }
+                if i < self.launcher_item_icon_handles.len() {
+                    self.launcher_item_icon_handles.remove(i);
+                }
+                if self.launcher_items.is_empty() {
+                    if self.alt_tab {
+                        return self.hide();
+                    }
+                } else if self.focused >= self.launcher_items.len() {
+                    self.focused = self.launcher_items.len() - 1;
                 }
             }
         }
