@@ -208,6 +208,7 @@ pub enum Message {
     Thumb(crate::wayland::Event),
     Hover(usize),
     Unhover,
+    CloseWindow(usize),
 }
 
 impl CosmicLauncher {
@@ -309,19 +310,20 @@ impl CosmicLauncher {
     /// Correlates by window title. pop-launcher exposes the real window title
     /// as either the item name or description, and terminal titles carry an
     /// animated spinner glyph, so titles are normalized before comparing.
-    fn thumbnail_for(&self, item: &SearchResult) -> Option<&cosmic::widget::image::Handle> {
+    fn thumbnail_entry_for(&self, item: &SearchResult) -> Option<&ThumbEntry> {
         if item.window.is_none() {
             return None;
         }
         let a = norm_title(&item.description);
         let b = norm_title(&item.name);
-        self.thumbnails
-            .iter()
-            .find(|t| {
-                let tt = norm_title(&t.title);
-                !tt.is_empty() && (tt == a || tt == b)
-            })
-            .map(|t| &t.image)
+        self.thumbnails.iter().find(|t| {
+            let tt = norm_title(&t.title);
+            !tt.is_empty() && (tt == a || tt == b)
+        })
+    }
+
+    fn thumbnail_for(&self, item: &SearchResult) -> Option<&cosmic::widget::image::Handle> {
+        self.thumbnail_entry_for(item).map(|t| &t.image)
     }
 
     /// The real window title for a launcher item (for the hover label).
@@ -368,6 +370,32 @@ impl CosmicLauncher {
                         .width(Length::Fixed(THUMB_W))
                         .height(Length::Fixed(THUMB_H))
                         .into()
+                };
+
+                // Windows-style close (X) in the thumbnail's top-right corner,
+                // revealed on hover/focus. Only shown when we have a live window
+                // to close (a matched toplevel), so the click always has a target.
+                let media: Element<Message> = if revealed && self.thumbnail_entry_for(item).is_some()
+                {
+                    let close = container(
+                        button::custom(icon::from_name("window-close-symbolic").size(16))
+                            .class(Button::Destructive)
+                            .padding(4)
+                            .on_press(Message::CloseWindow(i)),
+                    )
+                    .width(Length::Fixed(THUMB_W))
+                    .height(Length::Fixed(THUMB_H))
+                    .align_x(Horizontal::Right)
+                    .align_y(Vertical::Top)
+                    .padding(6);
+                    cosmic::iced::widget::Stack::new()
+                        .width(Length::Fixed(THUMB_W))
+                        .height(Length::Fixed(THUMB_H))
+                        .push(media)
+                        .push(close)
+                        .into()
+                } else {
+                    media
                 };
 
                 // Window name — hidden until this cell is focused or hovered.
@@ -445,6 +473,7 @@ impl CosmicLauncher {
                     .on_enter(Message::Hover(i))
                     .on_exit(Message::Unhover)
                     .on_right_release(Message::Context(i))
+                    .on_middle_release(Message::CloseWindow(i))
                     .into()
             })
             .collect();
@@ -966,6 +995,16 @@ impl cosmic::Application for CosmicLauncher {
             }
             Message::Unhover => {
                 self.hovered = None;
+            }
+            Message::CloseWindow(i) => {
+                let identifier = self
+                    .launcher_items
+                    .get(i)
+                    .and_then(|item| self.thumbnail_entry_for(item))
+                    .map(|t| t.identifier.clone());
+                if let (Some(identifier), Some(tx)) = (identifier, &self.thumb_tx) {
+                    let _ = tx.send(crate::wayland::Cmd::Close(identifier));
+                }
             }
         }
         Task::none()

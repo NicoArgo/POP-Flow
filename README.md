@@ -19,6 +19,9 @@ touched — the compositor is left completely alone.
 - 🔲 **Rounded thumbnail corners** (anti-aliased alpha mask).
 - 🏷️ **Clean by default** — the window title is hidden and only appears on the
   **selected** or **hovered** thumbnail.
+- ❌ **Close from the switcher** — a Windows-style close button appears on the
+  hovered/selected thumbnail (or middle-click any thumbnail) to close that window
+  via the Wayland `cosmic-toplevel-management` protocol, without switching to it.
 - 🪶 Capturing only runs **while the switcher is open**, so there's no idle cost.
 
 > Screenshot: _add your own — the switcher renders whatever windows you have open._
