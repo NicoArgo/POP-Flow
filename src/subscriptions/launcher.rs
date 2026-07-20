@@ -11,6 +11,11 @@ use tokio::sync::{mpsc, oneshot};
 pub enum Request {
     Search(String),
     Activate(u32),
+    /// Close (quit) the window behind a search result, by its pop-launcher id.
+    /// Routed to `pop_launcher::Request::Quit`, which asks the owning plugin to
+    /// close that exact window — no title correlation, so it can never hit the
+    /// wrong one.
+    Quit(u32),
     Context(u32),
     Complete(u32),
     ActivateContext(u32, u32),
@@ -113,6 +118,11 @@ pub fn service() -> impl Stream<Item = Event> + MaybeSend {
                 Request::Activate(i) => {
                     if let Some((client, _)) = client_request(&responses_tx, client) {
                         let _res = client.send(pop_launcher::Request::Activate(i)).await;
+                    }
+                }
+                Request::Quit(i) => {
+                    if let Some((client, _)) = client_request(&responses_tx, client) {
+                        let _res = client.send(pop_launcher::Request::Quit(i)).await;
                     }
                 }
                 Request::Context(i) => {

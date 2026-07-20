@@ -26,9 +26,7 @@ use cosmic::cctk::sctk::{
     registry::{ProvidesRegistryState, RegistryState},
     shm::{raw::RawPool, Shm, ShmHandler},
 };
-use cosmic::cctk::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1;
 use cosmic::cctk::toplevel_info::{ToplevelInfoHandler, ToplevelInfoState};
-use cosmic::cctk::toplevel_management::{ToplevelManagerHandler, ToplevelManagerState};
 use cosmic::cctk::wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_buffer, wl_output, wl_shm},
@@ -53,9 +51,6 @@ pub enum Event {
     },
     /// A toplevel went away.
     Closed(String),
-    /// Whether the compositor's toplevel-management protocol is present and
-    /// advertises the `Close` capability. Gates the close (X) affordance.
-    CloseSupported(bool),
 }
 
 impl std::fmt::Debug for Event {
@@ -74,9 +69,6 @@ impl std::fmt::Debug for Event {
                 .field("app_id", app_id)
                 .finish_non_exhaustive(),
             Event::Closed(id) => f.debug_tuple("Event::Closed").field(id).finish(),
-            Event::CloseSupported(v) => {
-                f.debug_tuple("Event::CloseSupported").field(v).finish()
-            }
         }
     }
 }
@@ -87,10 +79,6 @@ pub enum Cmd {
     /// Start/stop actively capturing thumbnails. Capturing is only worthwhile
     /// while the alt-tab switcher is on screen.
     SetActive(bool),
-    /// Close the toplevel with this identifier (the Windows-style X on a
-    /// thumbnail). Sends a `close` request through the cosmic
-    /// toplevel-management protocol.
-    Close(String),
 }
 
 /// The iced subscription that owns the capture thread for the app's lifetime.
@@ -118,9 +106,6 @@ struct AppData {
     shm_state: Shm,
     screencopy_state: ScreencopyState,
     toplevel_info_state: ToplevelInfoState,
-    /// Cosmic toplevel-management global, used to close windows. `None` if the
-    /// compositor doesn't advertise the protocol.
-    toplevel_manager_state: Option<ToplevelManagerState>,
     sender: mpsc::UnboundedSender<Event>,
     active: bool,
     /// identifier -> live capture session (kept alive so it isn't dropped).
@@ -164,27 +149,6 @@ impl AppData {
                     self.sessions.clear();
                 }
             }
-            Cmd::Close(identifier) => self.close_toplevel(&identifier),
-        }
-    }
-
-    /// Ask the compositor to close the toplevel identified by `identifier`.
-    /// The window's disappearance comes back through `toplevel_closed`, which
-    /// tears down the session and notifies the app — so we don't touch state
-    /// here.
-    fn close_toplevel(&self, identifier: &str) {
-        let Some(state) = self.toplevel_manager_state.as_ref() else {
-            tracing::warn!("cannot close window: toplevel-management protocol unavailable");
-            return;
-        };
-        let cosmic_handle = self
-            .toplevel_info_state
-            .toplevels()
-            .find(|info| info.identifier == identifier)
-            .and_then(|info| info.cosmic_toplevel.clone());
-        match cosmic_handle {
-            Some(handle) => state.manager.close(&handle),
-            None => tracing::warn!("cannot close window: no cosmic handle for {identifier}"),
         }
     }
 
@@ -368,27 +332,6 @@ impl ToplevelInfoHandler for AppData {
     }
 }
 
-impl ToplevelManagerHandler for AppData {
-    fn toplevel_manager_state(&mut self) -> &mut ToplevelManagerState {
-        self.toplevel_manager_state.as_mut().unwrap()
-    }
-
-    fn capabilities(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        capabilities: Vec<
-            WEnum<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>,
-        >,
-    ) {
-        use zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1 as Cap;
-        let can_close = capabilities
-            .iter()
-            .any(|c| matches!(c, WEnum::Value(Cap::Close)));
-        self.send_event(Event::CloseSupported(can_close));
-    }
-}
-
 impl ShmHandler for AppData {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm_state
@@ -470,7 +413,6 @@ fn start(conn: Connection) -> mpsc::UnboundedReceiver<Event> {
             shm_state,
             screencopy_state: ScreencopyState::new(&globals, &qh),
             toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
-            toplevel_manager_state: ToplevelManagerState::try_new(&registry_state, &qh),
             registry_state,
             sender,
             active: false,
@@ -603,5 +545,4 @@ sctk::delegate_shm!(AppData);
 sctk::delegate_output!(AppData);
 cosmic::cctk::delegate_screencopy!(AppData);
 cosmic::cctk::delegate_toplevel_info!(AppData);
-cosmic::cctk::delegate_toplevel_manager!(AppData);
 cosmic::cctk::wayland_client::delegate_noop!(AppData: ignore wl_buffer::WlBuffer);

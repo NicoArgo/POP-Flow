@@ -165,9 +165,6 @@ pub struct CosmicLauncher {
     thumbnails: Vec<ThumbEntry>,
     /// Channel to tell the capture thread to start/stop capturing.
     thumb_tx: Option<calloop::channel::Sender<crate::wayland::Cmd>>,
-    /// Whether the compositor lets us close windows (toplevel-management with the
-    /// `Close` capability). Gates the close (X) affordance in the switcher.
-    close_supported: bool,
     /// Index of the alt-tab cell currently hovered by the pointer, if any.
     hovered: Option<usize>,
     tx: Option<mpsc::Sender<launcher::Request>>,
@@ -332,6 +329,8 @@ impl CosmicLauncher {
     }
 
     /// A representative thumbnail image to show for an item (first title match).
+    /// Used by the plain launcher list; the alt-tab grid uses the stricter 1:1
+    /// [`Self::assign_thumbnails`] instead.
     fn thumbnail_for(&self, item: &SearchResult) -> Option<&cosmic::widget::image::Handle> {
         self.matching_thumbs(item)
             .into_iter()
@@ -339,12 +338,17 @@ impl CosmicLauncher {
             .map(|t| &t.image)
     }
 
-    /// The toplevel identifier to close for this item, or `None` when it can't be
-    /// pinned to a single window — closing an ambiguous title risks killing the
-    /// wrong window, so we refuse. Same-title matches are narrowed by app id.
-    fn close_target_for(&self, item: &SearchResult) -> Option<String> {
-        let candidates = self.matching_thumbs(item);
-        pick_close_target(item, &candidates).map(|t| t.identifier.clone())
+    /// Assign at most one captured thumbnail to each launcher item, 1:1, so two
+    /// windows that share a title never render the *same* image. Greedy in list
+    /// order: each window item claims the first still-unclaimed thumbnail whose
+    /// normalized title matches, preferring one whose app id also matches.
+    /// Returns a per-item vector of indices into `self.thumbnails`.
+    ///
+    /// This only decides which image is drawn — closing/activating a window is
+    /// done by pop-launcher id, never by this correlation, so a mismatch here is
+    /// cosmetic and can never act on the wrong window.
+    fn assign_thumbnails(&self) -> Vec<Option<usize>> {
+        assign_thumbs(&self.launcher_items, &self.thumbnails)
     }
 
     /// The real window title for a launcher item (for the hover label).
@@ -361,6 +365,12 @@ impl CosmicLauncher {
     fn alt_tab_view(&self) -> Element<'_, Message> {
         const THUMB_W: f32 = 264.0;
         const THUMB_H: f32 = 156.0;
+        // Reserve one caption line under every thumbnail so revealing the title
+        // on focus/hover doesn't grow the cell and reflow the whole grid.
+        const LABEL_H: f32 = 20.0;
+
+        // 1:1 image assignment so two same-title windows never share a picture.
+        let thumb_assign = self.assign_thumbnails();
 
         let cells: Vec<Element<Message>> = self
             .launcher_items
@@ -371,7 +381,12 @@ impl CosmicLauncher {
                 let revealed = is_focused || self.hovered == Some(i);
 
                 // Live thumbnail, or icon fallback while it loads / if unmatched.
-                let media: Element<Message> = if let Some(handle) = self.thumbnail_for(item) {
+                let media: Element<Message> = if let Some(handle) = thumb_assign
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map(|ti| &self.thumbnails[ti].image)
+                {
                     cosmic::widget::image::Image::new(handle.clone())
                         .width(Length::Fixed(THUMB_W))
                         .height(Length::Fixed(THUMB_H))
@@ -394,20 +409,17 @@ impl CosmicLauncher {
                 };
 
                 // Windows-style close (X) in the thumbnail's top-right corner,
-                // revealed on hover/focus. Only shown when the compositor lets us
-                // close windows AND the item maps to a single, unambiguous window
-                // — so the click never risks closing the wrong one.
-                let media: Element<Message> = if revealed
-                    && self.close_supported
-                    && self.close_target_for(item).is_some()
-                {
+                // revealed on hover/focus. Shown for every window item: closing
+                // goes through pop-launcher by id, so it always hits this exact
+                // window — never a look-alike.
+                let media: Element<Message> = if revealed && item.window.is_some() {
                     let x_button = button::custom(icon::from_name("window-close-symbolic").size(16))
                         .class(Button::Destructive)
                         .padding(4)
                         .on_press(Message::CloseWindow(i));
                     let close = container(cosmic::widget::tooltip(
                         x_button,
-                        text::body("Close window"),
+                        text::body(fl!("close-window")),
                         cosmic::widget::tooltip::Position::Top,
                     ))
                     .width(Length::Fixed(THUMB_W))
@@ -425,26 +437,28 @@ impl CosmicLauncher {
                     media
                 };
 
-                // Window name — hidden until this cell is focused or hovered.
+                // Window name — hidden until this cell is focused or hovered, but
+                // its row is always reserved (LABEL_H) so the grid never reflows.
                 let title = Self::window_title(item);
                 let title = if title.width() > 40 {
                     format!("{}…", title.unicode_truncate(40).0)
                 } else {
                     title.to_string()
                 };
-                let label: Element<Message> = if revealed {
-                    container(text::caption(title).class(theme::Text::Custom(|t| {
+                let label: Element<Message> = container(if revealed {
+                    Element::from(text::caption(title).class(theme::Text::Custom(|t| {
                         cosmic::iced::widget::text::Style {
                             color: Some(t.cosmic().on_bg_color().into()),
                         }
                     })))
-                    .width(Length::Fixed(THUMB_W))
-                    .align_x(Horizontal::Center)
-                    .padding([2, 4])
-                    .into()
                 } else {
-                    vertical_space().height(Length::Fixed(0.0)).into()
-                };
+                    horizontal_space().width(Length::Fixed(0.0)).into()
+                })
+                .width(Length::Fixed(THUMB_W))
+                .height(Length::Fixed(LABEL_H))
+                .align_x(Horizontal::Center)
+                .align_y(Vertical::Center)
+                .into();
 
                 let cell = column![media, label].spacing(6).align_x(Alignment::Center);
 
@@ -582,30 +596,74 @@ fn app_id_matches(app_id: &str, hint: &str) -> bool {
     a == hint || last == hint || a.contains(hint) || hint.contains(last)
 }
 
-/// From the thumbnails whose title matches an item, pick the single one that is
-/// safe to close: exactly one match, or — when several share the title — the sole
-/// one whose app id matches the item. `None` means "ambiguous, don't close".
-fn pick_close_target<'a>(
-    item: &SearchResult,
-    candidates: &[&'a ThumbEntry],
-) -> Option<&'a ThumbEntry> {
-    if let [only] = candidates {
-        return Some(*only);
-    }
-    if candidates.is_empty() {
-        return None;
-    }
-    let hint = item_app_hint(item)?;
-    let narrowed: Vec<&ThumbEntry> = candidates
+/// Greedy 1:1 assignment of captured thumbnails to launcher items (see
+/// [`CosmicLauncher::assign_thumbnails`]). Pulled out as a free function over
+/// slices so it can be unit-tested without a full app instance.
+fn assign_thumbs(items: &[SearchResult], thumbs: &[ThumbEntry]) -> Vec<Option<usize>> {
+    let mut used = vec![false; thumbs.len()];
+    items
         .iter()
-        .copied()
-        .filter(|t| app_id_matches(&t.app_id, &hint))
-        .collect();
-    if let [only] = narrowed.as_slice() {
-        Some(*only)
-    } else {
-        None
+        .map(|item| {
+            item.window?;
+            let a = norm_title(&item.description);
+            let b = norm_title(&item.name);
+            let hint = item_app_hint(item);
+            let mut fallback: Option<usize> = None;
+            for (ti, t) in thumbs.iter().enumerate() {
+                if used[ti] {
+                    continue;
+                }
+                let tt = norm_title(&t.title);
+                if tt.is_empty() || (tt != a && tt != b) {
+                    continue;
+                }
+                // A title + app_id match is unambiguous — take it at once.
+                if hint
+                    .as_deref()
+                    .is_some_and(|h| app_id_matches(&t.app_id, h))
+                {
+                    used[ti] = true;
+                    return Some(ti);
+                }
+                // Otherwise keep the first title-only match as a fallback.
+                if fallback.is_none() {
+                    fallback = Some(ti);
+                }
+            }
+            if let Some(ti) = fallback {
+                used[ti] = true;
+            }
+            fallback
+        })
+        .collect()
+}
+
+/// Grouping key for clustering windows of the same application: the item's app
+/// hint (from its icon / app id) when available, else its lowercased display
+/// name. Windows of one app share a key and are drawn next to each other.
+fn group_key(item: &SearchResult) -> String {
+    item_app_hint(item).unwrap_or_else(|| item.name.to_lowercase())
+}
+
+/// Reorder results so windows of the same application sit next to each other,
+/// disturbing the existing (MRU) order as little as possible: applications
+/// appear in the order their most-recent window already appears, and windows
+/// within one application keep their relative order. Window items are kept
+/// ahead of non-window items, preserving the previous partition. Stable.
+fn group_by_app(items: &mut [SearchResult]) {
+    // First-occurrence rank of each app group in the current order, so the app
+    // owning the most-recent window stays first.
+    let mut rank: HashMap<String, usize> = HashMap::new();
+    for item in items.iter() {
+        let next = rank.len();
+        rank.entry(group_key(item)).or_insert(next);
     }
+    items.sort_by_key(|item| {
+        (
+            i32::from(item.window.is_none()),
+            rank.get(&group_key(item)).copied().unwrap_or(usize::MAX),
+        )
+    });
 }
 
 async fn launch(
@@ -659,7 +717,6 @@ impl cosmic::Application for CosmicLauncher {
                 launcher_item_icon_handles: Vec::new(),
                 thumbnails: Vec::new(),
                 thumb_tx: None,
-                close_supported: false,
                 hovered: None,
                 tx: None,
                 menu: None,
@@ -843,13 +900,15 @@ impl cosmic::Application for CosmicLauncher {
                             return self.hide();
                         }
                         if self.alt_tab || self.input_value.is_empty() {
+                            // Window-list views (alt-tab, empty launcher): most
+                            // recent first, then cluster same-app windows.
                             list.reverse();
+                            group_by_app(&mut list);
+                        } else {
+                            // Search view: keep pop-launcher's relevance order,
+                            // only floating window matches above the rest.
+                            list.sort_by_key(|item| i32::from(item.window.is_none()));
                         }
-                        list.sort_by(|a, b| {
-                            let a = i32::from(a.window.is_none());
-                            let b = i32::from(b.window.is_none());
-                            a.cmp(&b)
-                        });
                         self.launcher_items.splice(.., list);
                         // Keep the focused index in range when the list shrinks
                         // (e.g. after a window closes) so nothing points past the
@@ -1068,9 +1127,6 @@ impl cosmic::Application for CosmicLauncher {
                 crate::wayland::Event::Closed(identifier) => {
                     self.thumbnails.retain(|t| t.identifier != identifier);
                 }
-                crate::wayland::Event::CloseSupported(supported) => {
-                    self.close_supported = supported;
-                }
             },
             Message::Hover(i) => {
                 self.hovered = Some(i);
@@ -1079,29 +1135,20 @@ impl cosmic::Application for CosmicLauncher {
                 self.hovered = None;
             }
             Message::CloseWindow(i) => {
-                // Resolve to a single unambiguous window; refuse otherwise so we
-                // never close the wrong one (see `close_target_for`).
-                let identifier = self
+                // Close the exact window by its pop-launcher id (never by title),
+                // so a look-alike window is never at risk.
+                let Some(id) = self
                     .launcher_items
                     .get(i)
-                    .and_then(|item| self.close_target_for(item));
-                let Some(identifier) = identifier else {
+                    .filter(|item| item.window.is_some())
+                    .map(|item| item.id)
+                else {
                     return Task::none();
                 };
-                let sent = if let Some(tx) = &self.thumb_tx {
-                    tx.send(crate::wayland::Cmd::Close(identifier)).is_ok()
-                } else {
-                    false
-                };
-                if !sent {
-                    return Task::none();
-                }
+                self.request(launcher::Request::Quit(id));
                 // Optimistically drop the entry so the grid updates immediately;
-                // the thumbnail is cleared later via `Event::Closed` and
-                // pop-launcher refreshes the list.
-                if i < self.launcher_items.len() {
-                    self.launcher_items.remove(i);
-                }
+                // pop-launcher refreshes the list on its next search.
+                self.launcher_items.remove(i);
                 if i < self.launcher_item_icon_handles.len() {
                     self.launcher_item_icon_handles.remove(i);
                 }
@@ -1557,5 +1604,126 @@ impl cosmic::Application for CosmicLauncher {
                 _ => None,
             }),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pop_launcher::IconSource;
+
+    fn item(id: u32, name: &str, desc: &str, icon: Option<&str>, is_window: bool) -> SearchResult {
+        SearchResult {
+            id,
+            name: name.into(),
+            description: desc.into(),
+            icon: icon.map(|s| IconSource::Name(s.to_string().into())),
+            category_icon: None,
+            window: is_window.then_some((0, id)),
+        }
+    }
+
+    fn thumb(identifier: &str, title: &str, app_id: &str) -> ThumbEntry {
+        ThumbEntry {
+            identifier: identifier.into(),
+            title: title.into(),
+            app_id: app_id.into(),
+            image: cosmic::widget::image::Handle::from_rgba(1, 1, vec![0u8; 4]),
+        }
+    }
+
+    fn ids(items: &[SearchResult]) -> Vec<u32> {
+        items.iter().map(|i| i.id).collect()
+    }
+
+    #[test]
+    fn norm_title_strips_leading_spinner_and_ws() {
+        // The terminal's animated braille glyph must not defeat correlation.
+        assert_eq!(norm_title("⠋ user@host: ~"), norm_title("user@host: ~"));
+        assert_eq!(norm_title("  Firefox  "), "Firefox");
+        assert_eq!(norm_title("***"), "");
+    }
+
+    #[test]
+    fn app_id_matches_reverse_dns_and_case() {
+        assert!(app_id_matches("org.mozilla.firefox", "firefox"));
+        assert!(app_id_matches("Firefox", "firefox"));
+        assert!(!app_id_matches("org.gnome.gedit", "firefox"));
+    }
+
+    #[test]
+    fn item_app_hint_normalizes_icon_name() {
+        assert_eq!(
+            item_app_hint(&item(1, "Firefox", "t", Some("org.mozilla.Firefox"), true)).as_deref(),
+            Some("org.mozilla.firefox")
+        );
+        assert_eq!(
+            item_app_hint(&item(1, "X", "t", Some("/a/b/foo.desktop"), true)).as_deref(),
+            Some("foo")
+        );
+        assert_eq!(item_app_hint(&item(1, "X", "t", None, true)), None);
+    }
+
+    #[test]
+    fn group_by_app_clusters_same_app_preserving_mru() {
+        // MRU-first order: firefox, code, firefox, gimp.
+        let mut list = vec![
+            item(1, "Firefox", "A1", Some("firefox"), true),
+            item(2, "Code", "B1", Some("code"), true),
+            item(3, "Firefox", "A2", Some("firefox"), true),
+            item(4, "GIMP", "C1", Some("gimp"), true),
+        ];
+        group_by_app(&mut list);
+        // The two firefox windows become adjacent; firefox stays first because
+        // it owns the most-recent window; app order is otherwise preserved.
+        assert_eq!(ids(&list), vec![1, 3, 2, 4]);
+    }
+
+    #[test]
+    fn group_by_app_keeps_non_windows_last() {
+        let mut list = vec![
+            item(1, "Firefox", "A1", Some("firefox"), true),
+            item(2, "Calculator", "run", Some("calc"), false),
+            item(3, "Firefox", "A2", Some("firefox"), true),
+        ];
+        group_by_app(&mut list);
+        assert_eq!(ids(&list), vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn assign_thumbs_gives_same_title_windows_distinct_images() {
+        // Two identical-title Firefox windows must not share one picture.
+        let items = vec![
+            item(1, "Firefox", "Mozilla Firefox", Some("firefox"), true),
+            item(2, "Firefox", "Mozilla Firefox", Some("firefox"), true),
+        ];
+        let thumbs = vec![
+            thumb("id-a", "Mozilla Firefox", "org.mozilla.firefox"),
+            thumb("id-b", "Mozilla Firefox", "org.mozilla.firefox"),
+        ];
+        let got = assign_thumbs(&items, &thumbs);
+        assert!(got[0].is_some() && got[1].is_some());
+        assert_ne!(got[0], got[1], "each window must claim its own thumbnail");
+    }
+
+    #[test]
+    fn assign_thumbs_prefers_app_id_over_title_only() {
+        let items = vec![item(1, "Firefox", "Doc", Some("firefox"), true)];
+        let thumbs = vec![
+            thumb("wrong", "Doc", "org.gnome.gedit"),
+            thumb("right", "Doc", "org.mozilla.firefox"),
+        ];
+        // Both share the title; the app-id match wins.
+        assert_eq!(assign_thumbs(&items, &thumbs), vec![Some(1)]);
+    }
+
+    #[test]
+    fn assign_thumbs_skips_non_windows_and_unmatched() {
+        let items = vec![
+            item(1, "Calc", "calculator", Some("calc"), false),
+            item(2, "Editor", "Untitled", Some("gedit"), true),
+        ];
+        let thumbs = vec![thumb("id", "Something Else", "org.x.y")];
+        assert_eq!(assign_thumbs(&items, &thumbs), vec![None, None]);
     }
 }
