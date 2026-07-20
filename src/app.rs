@@ -40,10 +40,10 @@ use cosmic::{Element, keyboard_nav};
 use cosmic::{iced_runtime, surface};
 use iced::keyboard::Key;
 use iced::{Alignment, Color};
-use pop_launcher::{ContextOption, GpuPreference, IconSource, SearchResult};
+use pop_launcher::{GpuPreference, IconSource, SearchResult};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::{
     collections::{HashMap, VecDeque},
@@ -153,6 +153,26 @@ pub struct ThumbEntry {
     image: cosmic::widget::image::Handle,
 }
 
+/// A single row in the right-click context menu.
+#[derive(Debug, Clone)]
+struct MenuEntry {
+    name: String,
+    action: MenuAction,
+}
+
+/// What activating a context-menu row does.
+#[derive(Debug, Clone)]
+pub enum MenuAction {
+    /// Activate a pop-launcher-provided context option: (result id, context id).
+    Context(u32, u32),
+    /// Open a terminal working in this directory.
+    OpenTerminal(String),
+    /// Reveal this path in the file manager.
+    OpenFolder(String),
+    /// Copy this path to the clipboard.
+    CopyPath(String),
+}
+
 #[derive(Clone)]
 pub struct CosmicLauncher {
     core: Core,
@@ -168,7 +188,9 @@ pub struct CosmicLauncher {
     /// Index of the alt-tab cell currently hovered by the pointer, if any.
     hovered: Option<usize>,
     tx: Option<mpsc::Sender<launcher::Request>>,
-    menu: Option<(u32, Vec<ContextOption>)>,
+    /// Open right-click context menu: the rows to show. Mixes pop-launcher's own
+    /// context options with launcher-side actions (open in terminal, etc.).
+    menu: Option<Vec<MenuEntry>>,
     cursor_position: Option<Point<f32>>,
     focused: usize,
     last_hide: Instant,
@@ -196,7 +218,7 @@ pub enum Message {
     CompleteFocusedId(Id),
     Activate(Option<usize>),
     Context(usize),
-    MenuButton(u32, u32),
+    MenuActivate(MenuAction),
     CloseContextMenu,
     CursorMoved(Point<f32>),
     Hide,
@@ -754,6 +776,77 @@ async fn launch(
     cosmic::desktop::spawn_desktop_exec(exec, envs, Some(&app_id), terminal).await;
 }
 
+/// Spawn a shell-style exec line detached from the launcher, used by the
+/// context-menu actions (e.g. "open in terminal").
+async fn spawn_exec(exec: String) {
+    cosmic::desktop::spawn_desktop_exec(exec, Vec::<(String, String)>::new(), None, false).await;
+}
+
+/// POSIX single-quote a string so a path with spaces or shell metacharacters
+/// survives the exec-line parsing in `spawn_desktop_exec`.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Extract an existing filesystem path from a search result, if it looks like
+/// one. File/folder results carry the absolute path in the description (or the
+/// name); a leading `~` is expanded. Returns `None` for windows and for text
+/// that doesn't resolve to something on disk, so apps don't get file actions.
+fn result_path(item: &SearchResult) -> Option<PathBuf> {
+    if item.window.is_some() {
+        return None;
+    }
+    for raw in [item.description.as_str(), item.name.as_str()] {
+        let raw = raw.trim();
+        let candidate = if let Some(rest) = raw.strip_prefix("~/") {
+            match std::env::var_os("HOME") {
+                Some(home) => Path::new(&home).join(rest),
+                None => continue,
+            }
+        } else if raw.starts_with('/') {
+            PathBuf::from(raw)
+        } else {
+            continue;
+        };
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Launcher-side context-menu rows for a result, shown above pop-launcher's own
+/// options. Keys off a filesystem path in the result (file/folder results
+/// expose one): "Open in terminal" at that location, "Open folder", "Copy path".
+/// Returns empty for results without a resolvable path (apps, windows).
+fn launcher_actions(item: &SearchResult) -> Vec<MenuEntry> {
+    let Some(path) = result_path(item) else {
+        return Vec::new();
+    };
+    // The directory to act on: the path itself when it's a folder, else its parent.
+    let dir = if path.is_dir() {
+        path.clone()
+    } else {
+        path.parent().map_or_else(|| path.clone(), Path::to_path_buf)
+    };
+    let dir = dir.to_string_lossy().into_owned();
+    let full = path.to_string_lossy().into_owned();
+    vec![
+        MenuEntry {
+            name: fl!("open-in-terminal"),
+            action: MenuAction::OpenTerminal(dir.clone()),
+        },
+        MenuEntry {
+            name: fl!("open-folder"),
+            action: MenuAction::OpenFolder(dir),
+        },
+        MenuEntry {
+            name: fl!("copy-path"),
+            action: MenuAction::CopyPath(full),
+        },
+    ]
+}
+
 async fn try_get_gpu_envs(gpu: GpuPreference) -> Option<HashMap<String, String>> {
     let connection = zbus::Connection::system().await.ok()?;
     let proxy = switcheroo_control::SwitcherooControlProxy::new(&connection)
@@ -865,11 +958,40 @@ impl cosmic::Application for CosmicLauncher {
             Message::CursorMoved(pos) => {
                 self.cursor_position = Some(pos);
             }
-            Message::MenuButton(i, context) => {
-                self.request(launcher::Request::ActivateContext(i, context));
-
-                if self.menu.take().is_some() {
-                    return commands::popup::destroy_popup(*MENU_ID);
+            Message::MenuActivate(action) => {
+                let close = if self.menu.take().is_some() {
+                    commands::popup::destroy_popup(*MENU_ID)
+                } else {
+                    Task::none()
+                };
+                match action {
+                    MenuAction::Context(id, context) => {
+                        self.request(launcher::Request::ActivateContext(id, context));
+                        return close;
+                    }
+                    MenuAction::OpenTerminal(dir) => {
+                        // Launch the COSMIC terminal in that directory, then hide.
+                        let exec =
+                            format!("cosmic-term --working-directory {}", sh_quote(&dir));
+                        return Task::batch([
+                            close,
+                            Task::perform(spawn_exec(exec), |()| {
+                                cosmic::action::app(Message::Hide)
+                            }),
+                        ]);
+                    }
+                    MenuAction::OpenFolder(dir) => {
+                        let exec = format!("xdg-open {}", sh_quote(&dir));
+                        return Task::batch([
+                            close,
+                            Task::perform(spawn_exec(exec), |()| {
+                                cosmic::action::app(Message::Hide)
+                            }),
+                        ]);
+                    }
+                    MenuAction::CopyPath(path) => {
+                        return Task::batch([close, cosmic::iced::clipboard::write(path)]);
+                    }
                 }
             }
             Message::OutputSize(w, h) => {
@@ -906,11 +1028,23 @@ impl cosmic::Application for CosmicLauncher {
                     }
                     #[allow(clippy::cast_possible_truncation)]
                     pop_launcher::Response::Context { id, options } => {
-                        if options.is_empty() {
+                        // Launcher-side actions (open in terminal, …) first, then
+                        // whatever context options pop-launcher offers for this item.
+                        let mut entries: Vec<MenuEntry> = self
+                            .launcher_items
+                            .iter()
+                            .find(|it| it.id == id)
+                            .map(launcher_actions)
+                            .unwrap_or_default();
+                        entries.extend(options.into_iter().map(|o| MenuEntry {
+                            name: o.name,
+                            action: MenuAction::Context(id, o.id),
+                        }));
+                        if entries.is_empty() {
                             return Task::none();
                         }
 
-                        self.menu = Some((id, options));
+                        self.menu = Some(entries);
                         let Some(pos) = self.cursor_position.as_ref() else {
                             return Task::none();
                         };
@@ -1581,15 +1715,15 @@ impl cosmic::Application for CosmicLauncher {
             return Element::from(autosize);
         }
         if id == *MENU_ID {
-            let Some((i, options)) = self.menu.as_ref() else {
+            let Some(entries) = self.menu.as_ref() else {
                 return container(horizontal_space().width(Length::Fixed(1.0)))
                     .width(Length::Fixed(1.0))
                     .height(Length::Fixed(1.0))
                     .into();
             };
-            let list_column = Column::with_children(options.iter().map(|option| {
-                menu_button(text::body(&option.name))
-                    .on_press(Message::MenuButton(*i, option.id))
+            let list_column = Column::with_children(entries.iter().map(|entry| {
+                menu_button(text::body(&entry.name))
+                    .on_press(Message::MenuActivate(entry.action.clone()))
                     .into()
             }))
             .padding([8, 0]);
@@ -1853,5 +1987,41 @@ mod tests {
                 assert!(h <= ah + 0.5, "n={n} rows={rows} height {h} > {ah}");
             }
         }
+    }
+
+    #[test]
+    fn sh_quote_wraps_and_escapes() {
+        assert_eq!(sh_quote("/home/user"), "'/home/user'");
+        assert_eq!(sh_quote("/a b/c"), "'/a b/c'"); // spaces survive
+        assert_eq!(sh_quote("it's"), "'it'\\''s'"); // embedded single quote
+    }
+
+    #[test]
+    fn result_path_resolves_existing_abs_path() {
+        // Root always exists and is a directory.
+        assert_eq!(
+            result_path(&item(1, "root", "/", Some("folder"), false)),
+            Some(PathBuf::from("/"))
+        );
+    }
+
+    #[test]
+    fn result_path_rejects_windows_and_non_paths() {
+        // Plain app result: no filesystem path -> no file actions.
+        assert_eq!(
+            result_path(&item(1, "Firefox", "Web Browser", Some("firefox"), false)),
+            None
+        );
+        // A window result never gets file actions, even if its text looks pathy.
+        assert_eq!(result_path(&item(2, "Term", "/", Some("term"), true)), None);
+    }
+
+    #[test]
+    fn launcher_actions_offers_terminal_for_folders() {
+        let acts = launcher_actions(&item(1, "root", "/", Some("folder"), false));
+        assert_eq!(acts.len(), 3);
+        assert!(matches!(acts[0].action, MenuAction::OpenTerminal(_)));
+        // Non-path results get no launcher-side actions.
+        assert!(launcher_actions(&item(2, "Firefox", "Web Browser", Some("ff"), false)).is_empty());
     }
 }
