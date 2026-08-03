@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # Undo setup-auto-reapply.sh: remove the APT hook and golden copy. Needs sudo.
 # This does NOT touch /usr/bin/cosmic-launcher — use ./uninstall.sh to restore
-# the original launcher.
+# the original binary.
 set -euo pipefail
 
-echo "==> Removing POP Flow auto-reapply hook (needs sudo)..."
-sudo rm -f /etc/apt/apt.conf.d/99-pop-flow-cosmic-launcher \
-           /usr/local/lib/pop-flow/reapply-cosmic-launcher \
-           /usr/local/lib/pop-flow/cosmic-launcher
-sudo rmdir --ignore-fail-on-non-empty /usr/local/lib/pop-flow 2>/dev/null || true
-echo "==> Auto-reapply removed."
+COMP=cosmic-launcher
+
+LIBDIR=/usr/local/lib/pop-flow
+
+echo "==> Removing POP Flow auto-reapply hook for $COMP (needs sudo)..."
+sudo rm -f "/etc/apt/apt.conf.d/99-pop-flow-$COMP" \
+           "$LIBDIR/reapply-$COMP" \
+           "$LIBDIR/$COMP"
+# Only removes the shared dir once the last component has been removed from it.
+sudo rmdir --ignore-fail-on-non-empty "$LIBDIR" 2>/dev/null || true
+echo "==> Auto-reapply removed for $COMP."

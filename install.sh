@@ -18,10 +18,17 @@ fi
 echo "==> Installing to /usr/bin/cosmic-launcher (needs sudo)..."
 sudo install -m 0755 "$BIN" /usr/bin/cosmic-launcher
 
-# Keep the auto-reapply golden copy in sync when a rebuild is installed.
-if [ -f /usr/local/lib/pop-flow/cosmic-launcher ]; then
+# Keep the auto-reapply golden copy in sync, or say out loud that this install
+# is temporary — silence here used to hide the fact that a package update wipes
+# the feature.
+GOLDEN=/usr/local/lib/pop-flow/cosmic-launcher
+if [ -f "$GOLDEN" ]; then
     echo "==> Refreshing auto-reapply golden copy"
-    sudo install -m 0755 "$BIN" /usr/local/lib/pop-flow/cosmic-launcher
+    sudo install -m 0755 "$BIN" "$GOLDEN"
+else
+    echo "!! No auto-reapply hook installed: the next package update of"
+    echo "   cosmic-launcher will silently restore the stock binary."
+    echo "   Run ./setup-auto-reapply.sh to make this install stick."
 fi
 
 pkill -x cosmic-launcher 2>/dev/null || true

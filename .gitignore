@@ -23,4 +23,6 @@ debian/*
 !debian/links
 !debian/rules
 !debian/source
-cosmic-launcher.orig
+
+# POP Flow: system-binary backups made by install.sh — never commit these.
+*.orig
