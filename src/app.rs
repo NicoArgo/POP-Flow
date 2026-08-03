@@ -1,58 +1,67 @@
-use crate::{app::iced::event::listen_raw, components, fl, subscriptions::launcher};
+use crate::app::iced::event::listen_raw;
+use crate::subscriptions::launcher;
+use crate::{components, fl};
 use clap::Parser;
 use cosmic::app::{Core, CosmicFlags, Settings, Task};
 use cosmic::cctk::sctk;
+use cosmic::cctk::sctk::shell::wlr_layer;
 use cosmic::dbus_activation::Details;
 use cosmic::iced::alignment::{Horizontal, Vertical};
+use cosmic::iced::core::text::{Ellipsize, EllipsizeHeightLimit};
 use cosmic::iced::event::Status;
-use cosmic::iced::event::wayland::{OutputEvent, OverlapNotifyEvent};
+use cosmic::iced::event::wayland::OverlapNotifyEvent;
 use cosmic::iced::id::Id;
+use cosmic::iced::keyboard::key::Named;
 use cosmic::iced::platform_specific::runtime::wayland::{
     layer_surface::SctkLayerSurfaceSettings,
     popup::{SctkPopupSettings, SctkPositioner},
 };
+use cosmic::iced::platform_specific::shell::commands::layer_surface::set_padding;
+use cosmic::iced::platform_specific::shell::commands::{self};
 use cosmic::iced::platform_specific::shell::commands::{
-    self,
     activation::request_token,
     layer_surface::{Anchor, KeyboardInteractivity, destroy_layer_surface, get_layer_surface},
 };
+use cosmic::iced::platform_specific::shell::wayland::commands::overlap_notify::overlap_notify;
+use cosmic::iced::runtime::core::event::wayland::{LayerEvent, OutputEvent};
+use cosmic::iced::runtime::core::event::{PlatformSpecific, wayland};
+use cosmic::iced::runtime::core::layout::Limits;
+use cosmic::iced::runtime::core::window::{Event as WindowEvent, Id as SurfaceId};
+use cosmic::iced::runtime::platform_specific::wayland::CornerRadius;
+use cosmic::iced::runtime::platform_specific::wayland::layer_surface::IcedMargin;
+use cosmic::iced::runtime::{Action, platform_specific, task};
+use cosmic::iced::widget::operation;
+use cosmic::iced::widget::row;
+use cosmic::iced::widget::scrollable::RelativeOffset;
+// POP Flow: `Row` for the thumbnail grid's rows.
 use cosmic::iced::widget::{Column, Row, column, container};
-use cosmic::iced::{self, Length, Size, Subscription};
-use cosmic::iced_core::keyboard::key::Named;
-use cosmic::iced_core::widget::operation;
-use cosmic::iced_core::{Border, Padding, Point, Rectangle, Shadow, window};
-use cosmic::iced_runtime::core::event::wayland::LayerEvent;
-use cosmic::iced_runtime::core::event::{PlatformSpecific, wayland};
-use cosmic::iced_runtime::core::layout::Limits;
-use cosmic::iced_runtime::core::window::{Event as WindowEvent, Id as SurfaceId};
-use cosmic::iced_widget::row;
-use cosmic::iced_widget::scrollable::RelativeOffset;
-use cosmic::iced_winit::commands::overlap_notify::overlap_notify;
+use cosmic::iced::{
+    self, Border, Length, Padding, Point, Rectangle, Shadow, Size, Subscription, window,
+};
+use cosmic::surface::action::{LiveSettings, app_layer_shell, simple_layer_shell};
 use cosmic::theme::{self, Button, Container};
 use cosmic::widget::icon::IconFallback;
-use cosmic::widget::id_container;
-use cosmic::widget::{
-    autosize, button, divider, horizontal_space, icon, mouse_area, scrollable, text,
-    text_input::{self, StyleSheet as TextInputStyleSheet},
-    vertical_space,
-};
-use cosmic::{Element, keyboard_nav};
-use cosmic::{iced_runtime, surface};
-use iced::keyboard::Key;
+use cosmic::widget::space::{horizontal as horizontal_space, vertical as vertical_space};
+use cosmic::widget::text_input::{self, StyleSheet as TextInputStyleSheet};
+use cosmic::widget::{autosize, button, divider, icon, id_container, mouse_area, scrollable, text};
+use cosmic::{Element, keyboard_nav, surface};
+use iced::keyboard::{Key, Modifiers};
 use iced::{Alignment, Color};
 use pop_launcher::{GpuPreference, IconSource, SearchResult};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
+// POP Flow: `PathBuf` for the context menu's file-path extraction.
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::str::FromStr;
 use std::sync::LazyLock;
-use std::{
-    collections::{HashMap, VecDeque},
-    rc::Rc,
-    str::FromStr,
-    time::Instant,
-};
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
+// POP Flow: the thumbnail grid truncates window titles by display width, so a
+// CJK or emoji title doesn't get cut mid-glyph. Upstream dropped both crates
+// when it rewrote the result list; they are ours now (see Cargo.toml).
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::UnicodeWidthStr;
 
@@ -195,6 +204,7 @@ pub struct CosmicLauncher {
     focused: usize,
     last_hide: Instant,
     alt_tab: bool,
+    alt_tab_released: bool,
     window_id: window::Id,
     queue: VecDeque<Message>,
     result_ids: Vec<Id>,
@@ -208,6 +218,7 @@ pub struct CosmicLauncher {
     screen_size: Option<(f32, f32)>,
     needs_clear: bool,
     hand_over: String,
+    dummy_id: Option<window::Id>,
 }
 
 #[derive(Debug, Clone)]
@@ -223,7 +234,8 @@ pub enum Message {
     CursorMoved(Point<f32>),
     Hide,
     LauncherEvent(launcher::Event),
-    Layer(LayerEvent),
+    Layer(LayerEvent, window::Id),
+    Output(OutputEvent),
     KeyboardNav(keyboard_nav::Action),
     ActivationToken(Option<String>, String, String, GpuPreference, bool),
     AltTab,
@@ -231,8 +243,6 @@ pub enum Message {
     Opened(Size, window::Id),
     AltRelease,
     Overlap(OverlapNotifyEvent),
-    /// Logical size (width, height) of an output, from a wayland output event.
-    OutputSize(f32, f32),
     Surface(surface::Action),
     Thumb(crate::wayland::Event),
     Hover(usize),
@@ -252,13 +262,50 @@ impl CosmicLauncher {
         }
     }
 
+    fn create_dummy_layer_surface(&mut self) -> Task<Message> {
+        self.needs_clear = true;
+        let id = window::Id::unique();
+        self.dummy_id = Some(id);
+        Task::batch(vec![
+            cosmic::surface::surface_task(simple_layer_shell::<Message>(
+                || LiveSettings {
+                    padding: Some(IcedMargin::default()),
+                    corners: Some(CornerRadius::default()),
+                    blur: Some(false),
+                },
+                move || {
+                    SctkLayerSurfaceSettings {
+                        id,
+                        layer: wlr_layer::Layer::Bottom,
+                        keyboard_interactivity: wlr_layer::KeyboardInteractivity::None,
+                        input_zone: Some(Vec::new()),
+                        anchor: wlr_layer::Anchor::TOP,
+                        output:
+                            cosmic::iced::runtime::platform_specific::wayland::layer_surface::IcedOutput::Active,
+                        namespace: "cosmic_launcher_dummy".into(),
+                        margin: IcedMargin::default(),
+                        size: Some((Some(200), Some(200))),
+                        exclusive_zone: -1,
+                        size_limits: Limits::NONE,
+                    }
+                },
+                None::<fn() -> Element<'static, cosmic::Action<Message>>>,
+            )),
+            self.handle_overlap(),
+            overlap_notify(id, true),
+        ])
+    }
+
     fn show(&mut self) -> Task<Message> {
         self.surface_state = SurfaceState::Visible;
-        self.needs_clear = true;
-
-        Task::batch(vec![
-            get_layer_surface(SctkLayerSurfaceSettings {
-                id: self.window_id,
+        cosmic::surface::surface_task(app_layer_shell(
+            |app: &CosmicLauncher| LiveSettings {
+                padding: Some(app.layer_padding()),
+                corners: None,
+                blur: None,
+            },
+            move |app: &mut CosmicLauncher| SctkLayerSurfaceSettings {
+                id: app.window_id,
                 keyboard_interactivity: KeyboardInteractivity::Exclusive,
                 anchor: Anchor::TOP,
                 namespace: "launcher".into(),
@@ -269,15 +316,17 @@ impl CosmicLauncher {
                 size_limits: Limits::NONE.min_width(1.0).min_height(1.0).max_width(8000.0),
                 exclusive_zone: -1,
                 ..Default::default()
-            }),
-            overlap_notify(self.window_id, true),
-        ])
+            },
+            None,
+        ))
+        .chain(self.handle_overlap())
     }
 
     fn hide(&mut self) -> Task<Message> {
         self.input_value.clear();
         self.focused = 0;
         self.alt_tab = false;
+        self.alt_tab_released = false;
         self.queue.clear();
         self.hand_over.clear();
         self.set_thumbs_active(false);
@@ -313,10 +362,7 @@ impl CosmicLauncher {
         self.focused = (self.focused + self.launcher_items.len() - 1) % self.launcher_items.len();
     }
 
-    fn handle_overlap(&mut self) {
-        if matches!(self.surface_state, SurfaceState::Hidden) {
-            return;
-        }
+    fn handle_overlap(&mut self) -> Task<Message> {
         let mid_height = self.height / 2.;
         self.margin = 0.;
 
@@ -329,6 +375,35 @@ impl CosmicLauncher {
             }
             self.margin = o.y + o.height;
         }
+        let mut cmds = Vec::with_capacity(2);
+        cmds.push(set_padding::<()>(self.window_id, self.layer_padding()).discard());
+        cmds.push(
+            if self.core.system_theme().cosmic().frosted_system_interface {
+                task::effect(Action::PlatformSpecific(
+                    platform_specific::Action::Wayland(
+                        cosmic::iced::runtime::platform_specific::wayland::Action::BlurSurface(
+                            self.window_id,
+                            Some(vec![Rectangle {
+                                x: 0.,
+                                y: 0.,
+                                width: f32::MAX,
+                                height: f32::MAX,
+                            }]),
+                        ),
+                    ),
+                ))
+            } else {
+                task::effect(Action::PlatformSpecific(
+                    platform_specific::Action::Wayland(
+                        cosmic::iced::runtime::platform_specific::wayland::Action::BlurSurface(
+                            self.window_id,
+                            None,
+                        ),
+                    ),
+                ))
+            },
+        );
+        Task::batch(cmds)
     }
 
     /// Tell the capture thread to start/stop capturing window thumbnails.
@@ -501,6 +576,7 @@ impl CosmicLauncher {
                     Element::from(text::caption(title).class(theme::Text::Custom(|t| {
                         cosmic::iced::widget::text::Style {
                             color: Some(t.cosmic().on_bg_color().into()),
+                            ..Default::default()
                         }
                     })))
                 } else {
@@ -602,19 +678,33 @@ impl CosmicLauncher {
                         container::Style {
                             text_color: Some(t.on_bg_color().into()),
                             icon_color: Some(t.on_bg_color().into()),
-                            background: Some(Color::from(t.background.base).into()),
+                            // Transparent-aware background: with blur active an
+                            // opaque fill would hide the frosted desktop behind
+                            // the layer surface.
+                            background: Some(
+                                Color::from(t.background(theme.transparent).base).into(),
+                            ),
                             border: Border {
                                 radius: radii.into(),
                                 width: 1.0,
                                 color: t.bg_divider().into(),
                             },
                             shadow: Shadow::default(),
+                            ..Default::default()
                         }
                     })))
                     .padding(16),
             );
 
         Element::from(autosize::autosize(window, AUTOSIZE_ID.clone()))
+    }
+
+    fn layer_padding(&self) -> IcedMargin {
+        IcedMargin {
+            #[allow(clippy::cast_possible_truncation)]
+            top: self.margin as i32 + 16,
+            ..Default::default()
+        }
     }
 }
 
@@ -756,6 +846,10 @@ fn grid_layout(n: usize, avail_w: f32, avail_h: f32) -> (usize, f32) {
     (best_cols, best_scale.max(MIN_SCALE))
 }
 
+fn alt_tab_modifier_is_released(modifiers: Modifiers) -> bool {
+    !modifiers.alt() && !modifiers.logo() && !modifiers.control()
+}
+
 async fn launch(
     token: Option<String>,
     app_id: String,
@@ -868,37 +962,42 @@ impl cosmic::Application for CosmicLauncher {
     const APP_ID: &'static str = "com.system76.CosmicLauncher";
 
     fn init(mut core: Core, _flags: Args) -> (Self, Task<Message>) {
+        core.set_app_type(cosmic::core::AppType::System);
+
         core.set_keyboard_nav(false);
-        (
-            CosmicLauncher {
-                core,
-                input_value: String::new(),
-                surface_state: SurfaceState::Hidden,
-                launcher_items: Vec::new(),
-                launcher_item_icon_handles: Vec::new(),
-                thumbnails: Vec::new(),
-                thumb_tx: None,
-                hovered: None,
-                tx: None,
-                menu: None,
-                cursor_position: None,
-                focused: 0,
-                last_hide: Instant::now(),
-                alt_tab: false,
-                window_id: SurfaceId::unique(),
-                queue: VecDeque::new(),
-                result_ids: (0..10)
-                    .map(|id| Id::new(id.to_string()))
-                    .collect::<Vec<_>>(),
-                margin: 0.,
-                overlap: HashMap::new(),
-                height: 100.,
-                screen_size: None,
-                needs_clear: false,
-                hand_over: String::default(),
-            },
-            Task::none(),
-        )
+
+        let mut app = CosmicLauncher {
+            core,
+            input_value: String::new(),
+            surface_state: SurfaceState::Hidden,
+            launcher_items: Vec::new(),
+            launcher_item_icon_handles: Vec::new(),
+            thumbnails: Vec::new(),
+            thumb_tx: None,
+            hovered: None,
+            tx: None,
+            menu: None,
+            cursor_position: None,
+            focused: 0,
+            last_hide: Instant::now(),
+            alt_tab: false,
+            alt_tab_released: false,
+            window_id: SurfaceId::unique(),
+            queue: VecDeque::new(),
+            result_ids: (0..10)
+                .map(|id| Id::new(id.to_string()))
+                .collect::<Vec<_>>(),
+            margin: 0.,
+            overlap: HashMap::new(),
+            height: 800.,
+            screen_size: None,
+            needs_clear: false,
+            hand_over: String::default(),
+            dummy_id: None,
+        };
+        let task = app.create_dummy_layer_surface();
+        app.needs_clear = false;
+        (app, task)
     }
 
     fn core(&self) -> &Core {
@@ -914,11 +1013,15 @@ impl cosmic::Application for CosmicLauncher {
         match message {
             Message::InputChanged(value) => {
                 self.input_value.clone_from(&value);
+                self.focused = 0;
                 self.request(launcher::Request::Search(value));
+                return operation::snap_to(SCROLLABLE.clone(), RelativeOffset::START);
             }
             Message::Backspace => {
                 self.input_value.pop();
+                self.focused = 0;
                 self.request(launcher::Request::Search(self.input_value.clone()));
+                return operation::snap_to(SCROLLABLE.clone(), RelativeOffset::START);
             }
             Message::TabPress if !self.alt_tab => {
                 let focused = self.focused;
@@ -940,8 +1043,12 @@ impl cosmic::Application for CosmicLauncher {
                 }
             }
             Message::Activate(i) => {
+                let alt_tab = self.alt_tab;
                 if let Some(item) = self.launcher_items.get(i.unwrap_or(self.focused)) {
                     self.request(launcher::Request::Activate(item.id));
+                    if alt_tab {
+                        return self.hide();
+                    }
                 } else {
                     return self.hide();
                 }
@@ -994,25 +1101,22 @@ impl cosmic::Application for CosmicLauncher {
                     }
                 }
             }
-            Message::OutputSize(w, h) => {
-                // Track the output the launcher sits on so the alt-tab grid can
-                // size itself to the screen. Single-monitor setups report one
-                // output; on multi-monitor we keep the most recent, which is a
-                // heuristic — good enough to pick a grid that fits.
-                if w > 1.0 && h > 1.0 {
-                    self.screen_size = Some((w, h));
-                }
-            }
             Message::Opened(size, window_id) => {
-                if window_id == self.window_id {
-                    self.height = size.height;
-                    self.handle_overlap();
+                let mut tasks = Vec::with_capacity(3);
+                if let Some(dummy) = self.dummy_id
+                    && dummy == window_id
+                {
+                    tasks.push(overlap_notify(window_id, true));
+                } else if self.dummy_id.is_none() {
+                    tasks.push(overlap_notify(self.window_id, true));
                 }
+
                 if !self.hand_over.is_empty() {
                     let input = self.hand_over.clone();
                     self.hand_over.clear();
-                    return self.update(Message::InputChanged(input));
+                    tasks.push(self.update(Message::InputChanged(input)));
                 }
+                return Task::batch(tasks);
             }
             Message::LauncherEvent(e) => match e {
                 launcher::Event::Started(tx) => {
@@ -1168,7 +1272,7 @@ impl cosmic::Application for CosmicLauncher {
                                         .handle(),
                                     // By mime
                                     IconSource::Mime(mime) => {
-                                        icon::from_name(mime.as_ref().replace("/", "-"))
+                                        icon::from_name(mime.as_ref().replace('/', "-"))
                                             .prefer_svg(true)
                                             .size(64)
                                             .fallback(Some(IconFallback::Names(vec![
@@ -1188,7 +1292,9 @@ impl cosmic::Application for CosmicLauncher {
                             cmds.push(updated);
                         }
 
-                        if self.surface_state == SurfaceState::WaitingToBeShown {
+                        if self.alt_tab_released {
+                            cmds.push(self.update(Message::Activate(None)));
+                        } else if self.surface_state == SurfaceState::WaitingToBeShown {
                             cmds.push(self.show());
                         }
                         return Task::batch(cmds);
@@ -1199,7 +1305,30 @@ impl cosmic::Application for CosmicLauncher {
                     }
                 },
             },
-            Message::Layer(e) => match e {
+            Message::Layer(LayerEvent::Done, id) if self.dummy_id == Some(id) => {
+                self.dummy_id = None;
+            }
+            Message::Output(event) => {
+                // Track the output the launcher sits on so the alt-tab grid can
+                // size itself to the screen. Single-monitor setups report one
+                // output; on multi-monitor we keep the most recent, which is a
+                // heuristic — good enough to pick a grid that fits.
+                if let OutputEvent::Created(Some(info)) | OutputEvent::InfoUpdate(info) = &event
+                    && let Some((w, h)) = info.logical_size
+                    && w > 1
+                    && h > 1
+                {
+                    self.screen_size = Some((w as f32, h as f32));
+                }
+
+                if matches!(event, OutputEvent::Created(_) | OutputEvent::InfoUpdate(_))
+                    && self.dummy_id.is_none()
+                {
+                    return self.create_dummy_layer_surface();
+                }
+            }
+            Message::Layer(_, id) if id != self.window_id => {}
+            Message::Layer(e, _) => match e {
                 LayerEvent::Focused | LayerEvent::Done => {}
                 LayerEvent::Unfocused => {
                     self.last_hide = Instant::now();
@@ -1221,11 +1350,11 @@ impl cosmic::Application for CosmicLauncher {
                     if exclusive > 0 || namespace == "Dock" || namespace == "Panel" {
                         self.overlap.insert(identifier, logical_rect);
                     }
-                    self.handle_overlap();
+                    return self.handle_overlap();
                 }
                 OverlapNotifyEvent::OverlapLayerRemove { identifier } => {
                     self.overlap.remove(&identifier);
-                    self.handle_overlap();
+                    return self.handle_overlap();
                 }
                 _ => {}
             },
@@ -1245,27 +1374,31 @@ impl cosmic::Application for CosmicLauncher {
                     keyboard_nav::Action::FocusNext => {
                         self.focus_next();
                         // TODO ideally we could use an operation to scroll exactly to a specific widget.
-                        return iced_runtime::task::widget(operation::scrollable::snap_to(
+                        return operation::snap_to(
                             SCROLLABLE.clone(),
                             RelativeOffset {
-                                x: 0.,
-                                y: (self.focused as f32
-                                    / (self.launcher_items.len() as f32 - 1.).max(1.))
-                                .max(0.0),
+                                x: None,
+                                y: Some(
+                                    (self.focused as f32
+                                        / (self.launcher_items.len() as f32 - 1.).max(1.))
+                                    .max(0.0),
+                                ),
                             },
-                        ));
+                        );
                     }
                     keyboard_nav::Action::FocusPrevious => {
                         self.focus_previous();
-                        return iced_runtime::task::widget(operation::scrollable::snap_to(
+                        return operation::snap_to(
                             SCROLLABLE.clone(),
                             RelativeOffset {
-                                x: 0.,
-                                y: (self.focused as f32
-                                    / (self.launcher_items.len() as f32 - 1.).max(1.))
-                                .max(0.0),
+                                x: None,
+                                y: Some(
+                                    (self.focused as f32
+                                        / (self.launcher_items.len() as f32 - 1.).max(1.))
+                                    .max(0.0),
+                                ),
                             },
-                        ));
+                        );
                     }
                     keyboard_nav::Action::Escape => {
                         self.input_value.clear();
@@ -1281,29 +1414,41 @@ impl cosmic::Application for CosmicLauncher {
             }
             Message::AltTab => {
                 self.focus_next();
-                return iced_runtime::task::widget(operation::scrollable::snap_to(
+                return operation::snap_to(
                     SCROLLABLE.clone(),
                     RelativeOffset {
-                        x: 0.,
-                        y: (self.focused as f32 / (self.launcher_items.len() as f32 - 1.).max(1.))
-                            .max(0.0),
+                        x: None,
+                        y: Some(
+                            (self.focused as f32 / (self.launcher_items.len() as f32 - 1.).max(1.))
+                                .max(0.0),
+                        ),
                     },
-                ));
+                );
             }
             Message::ShiftAltTab => {
                 self.focus_previous();
-                return iced_runtime::task::widget(operation::scrollable::snap_to(
+                return operation::snap_to(
                     SCROLLABLE.clone(),
                     RelativeOffset {
-                        x: 0.,
-                        y: (self.focused as f32 / (self.launcher_items.len() as f32 - 1.).max(1.))
-                            .max(0.0),
+                        x: None,
+                        y: Some(
+                            (self.focused as f32 / (self.launcher_items.len() as f32 - 1.).max(1.))
+                                .max(0.0),
+                        ),
                     },
-                ));
+                );
             }
             Message::AltRelease => {
                 if self.alt_tab {
-                    return self.update(Message::Activate(None));
+                    if self.surface_state == SurfaceState::Visible {
+                        debug!("alt-tab modifier released; activating focused item");
+                        return self.update(Message::Activate(None));
+                    }
+
+                    debug!(
+                        "alt-tab modifier released before launcher was visible; deferring activation"
+                    );
+                    self.alt_tab_released = true;
                 }
             }
             Message::Surface(a) => {
@@ -1407,21 +1552,35 @@ impl cosmic::Application for CosmicLauncher {
                 match cmd {
                     LauncherTasks::AltTab => {
                         if self.alt_tab {
+                            if self.surface_state == SurfaceState::WaitingToBeShown
+                                || self.launcher_items.is_empty()
+                            {
+                                self.queue.push_back(Message::AltTab);
+                                return Task::none();
+                            }
                             return self.update(Message::AltTab);
                         }
 
                         self.alt_tab = true;
                         self.set_thumbs_active(true);
+                        self.alt_tab_released = false;
                         self.request(launcher::Request::Search(String::new()));
                         self.queue.push_back(Message::AltTab);
                     }
                     LauncherTasks::ShiftAltTab => {
                         if self.alt_tab {
+                            if self.surface_state == SurfaceState::WaitingToBeShown
+                                || self.launcher_items.is_empty()
+                            {
+                                self.queue.push_back(Message::ShiftAltTab);
+                                return Task::none();
+                            }
                             return self.update(Message::ShiftAltTab);
                         }
 
                         self.alt_tab = true;
                         self.set_thumbs_active(true);
+                        self.alt_tab_released = false;
                         self.request(launcher::Request::Search(String::new()));
                         self.queue.push_back(Message::ShiftAltTab);
                     }
@@ -1463,7 +1622,7 @@ impl cosmic::Application for CosmicLauncher {
                     focused: Box::new(|theme| theme.focused(&cosmic::theme::TextInput::Search)),
                     disabled: Box::new(|theme| theme.disabled(&cosmic::theme::TextInput::Search)),
                 })
-                .width(600)
+                .width(600.)
                 .id(INPUT_ID.clone())
                 .always_active();
 
@@ -1479,33 +1638,33 @@ impl cosmic::Application for CosmicLauncher {
                     };
 
                     let name = Column::with_children(name.lines().map(|line| {
-                        text::body(if line.width() > 60 {
-                            format!("{}...", line.unicode_truncate(60).0)
-                        } else {
-                            line.to_string()
-                        })
-                        .align_x(Horizontal::Left)
-                        .align_y(Vertical::Center)
-                        .class(cosmic::theme::Text::Custom(|t| {
-                            cosmic::iced::widget::text::Style {
-                                color: Some(t.cosmic().on_bg_color().into()),
-                            }
-                        }))
-                        .into()
+                        text::body(line.to_string())
+                            .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)))
+                            .align_x(Horizontal::Left)
+                            .align_y(Vertical::Center)
+                            .class(cosmic::theme::Text::Custom(|t| {
+                                let theme = t.cosmic();
+                                cosmic::iced::widget::text::Style {
+                                    color: Some(theme.on_bg_color().into()),
+                                    selected_fill: theme.accent_color().into(),
+                                }
+                            }))
+                            .into()
                     }));
 
                     let desc = Column::with_children(desc.lines().map(|line| {
-                        text::caption(if line.width() > 80 {
-                            format!("{}...", line.unicode_truncate(80).0)
-                        } else {
-                            line.to_string()
-                        })
-                        .align_x(Horizontal::Left)
-                        .align_y(Vertical::Center)
-                        .class(theme::Text::Custom(|t| cosmic::iced::widget::text::Style {
-                            color: Some(t.cosmic().on_bg_color().into()),
-                        }))
-                        .into()
+                        text::caption(line.to_string())
+                            .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)))
+                            .align_x(Horizontal::Left)
+                            .align_y(Vertical::Center)
+                            .class(theme::Text::Custom(|t| {
+                                let theme = t.cosmic();
+                                cosmic::iced::widget::text::Style {
+                                    color: Some(theme.on_bg_color().into()),
+                                    selected_fill: theme.accent_color().into(),
+                                }
+                            }))
+                            .into()
                     }));
 
                     let mut button_content = Vec::new();
@@ -1522,7 +1681,7 @@ impl cosmic::Application for CosmicLauncher {
                             }
 
                             IconSource::Mime(mime) => {
-                                icon::from_name(mime.as_ref().replace("/", "-")).handle()
+                                icon::from_name(mime.as_ref().replace('/', "-")).handle()
                             }
                         };
 
@@ -1563,8 +1722,10 @@ impl cosmic::Application for CosmicLauncher {
                                     .align_y(Vertical::Center)
                                     .align_x(Horizontal::Right)
                                     .class(theme::Text::Custom(|t| {
+                                        let theme = t.cosmic();
                                         cosmic::iced::widget::text::Style {
-                                            color: Some(t.cosmic().on_bg_color().into()),
+                                            color: Some(theme.on_bg_color().into()),
+                                            selected_fill: theme.accent_color().into(),
                                         }
                                     })),
                             )
@@ -1656,7 +1817,7 @@ impl cosmic::Application for CosmicLauncher {
                 Column::new()
                     .max_width(600)
                     .spacing(16)
-                    .width(Length::Shrink)
+                    .width(Length::Fixed(600.))
                     .height(Length::Shrink)
             } else {
                 column![launcher_entry]
@@ -1673,7 +1834,7 @@ impl cosmic::Application for CosmicLauncher {
                 );
             } else if !buttons.is_empty() {
                 content = content.push(components::list::column(buttons));
-            };
+            }
 
             let window = Column::new()
                 .push(vertical_space().height(Length::Fixed(self.margin + 16.)))
@@ -1688,13 +1849,16 @@ impl cosmic::Application for CosmicLauncher {
                             container::Style {
                                 text_color: Some(t.on_bg_color().into()),
                                 icon_color: Some(t.on_bg_color().into()),
-                                background: Some(Color::from(t.background.base).into()),
+                                background: Some(
+                                    Color::from(t.background(theme.transparent).base).into(),
+                                ),
                                 border: Border {
                                     radius: radii.into(),
                                     width: 1.0,
                                     color: t.bg_divider().into(),
                                 },
                                 shadow: Shadow::default(),
+                                snap: true,
                             }
                         })))
                         .padding([24, 32]),
@@ -1733,15 +1897,18 @@ impl cosmic::Application for CosmicLauncher {
                     let cosmic = theme.cosmic();
                     let corners = cosmic.corner_radii;
                     container::Style {
-                        text_color: Some(cosmic.background.on.into()),
-                        background: Some(Color::from(cosmic.background.base).into()),
+                        text_color: Some(cosmic.background(theme.transparent).on.into()),
+                        background: Some(
+                            Color::from(cosmic.background(theme.transparent).base).into(),
+                        ),
                         border: Border {
                             radius: corners.radius_m.into(),
                             width: 1.0,
-                            color: cosmic.background.divider.into(),
+                            color: cosmic.background(theme.transparent).divider.into(),
                         },
                         shadow: Shadow::default(),
-                        icon_color: Some(cosmic.background.on.into()),
+                        icon_color: Some(cosmic.background(theme.transparent).on.into()),
+                        snap: true,
                     }
                 })),
             )
@@ -1761,23 +1928,25 @@ impl cosmic::Application for CosmicLauncher {
             crate::wayland::subscription().map(Message::Thumb),
             listen_raw(|e, status, id| match e {
                 cosmic::iced::Event::PlatformSpecific(PlatformSpecific::Wayland(
-                    wayland::Event::Layer(e, ..),
-                )) => Some(Message::Layer(e)),
+                    wayland::Event::Layer(e, _, layer_id),
+                )) => Some(Message::Layer(e, layer_id)),
                 cosmic::iced::Event::PlatformSpecific(PlatformSpecific::Wayland(
                     wayland::Event::OverlapNotify(event, ..),
                 )) => Some(Message::Overlap(event)),
                 cosmic::iced::Event::PlatformSpecific(PlatformSpecific::Wayland(
-                    wayland::Event::Output(output_event, ..),
-                )) => match output_event {
-                    OutputEvent::Created(Some(info)) | OutputEvent::InfoUpdate(info) => info
-                        .logical_size
-                        .map(|(w, h)| Message::OutputSize(w as f32, h as f32)),
-                    _ => None,
-                },
+                    wayland::Event::Output(event, _),
+                )) => Some(Message::Output(event)),
                 cosmic::iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
-                    key: Key::Named(Named::Alt | Named::Super),
+                    key: Key::Named(Named::Alt | Named::Super | Named::Control),
                     ..
                 }) => Some(Message::AltRelease),
+                cosmic::iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
+                    modifiers,
+                    ..
+                }) if alt_tab_modifier_is_released(modifiers) => Some(Message::AltRelease),
+                cosmic::iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+                    modifiers,
+                )) if alt_tab_modifier_is_released(modifiers) => Some(Message::AltRelease),
                 cosmic::iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                     key,
                     text: _,

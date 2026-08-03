@@ -83,20 +83,22 @@ pub enum Cmd {
 
 /// The iced subscription that owns the capture thread for the app's lifetime.
 pub fn subscription() -> cosmic::iced::Subscription<Event> {
-    cosmic::iced::Subscription::run_with_id(
-        "cosmic-launcher-thumbnails",
-        cosmic::iced_futures::stream::channel(20, |mut output| async move {
-            let Ok(conn) = Connection::connect_to_env() else {
-                tracing::warn!("thumbnail backend: no wayland connection");
-                std::future::pending::<()>().await;
-                unreachable!();
-            };
-            let mut receiver = start(conn);
-            while let Some(event) = receiver.next().await {
-                let _ = output.send(event).await;
-            }
-        }),
-    )
+    cosmic::iced::Subscription::run_with("cosmic-launcher-thumbnails", |_| {
+        cosmic::iced::stream::channel(
+            20,
+            |mut output: cosmic::iced::futures::channel::mpsc::Sender<Event>| async move {
+                let Ok(conn) = Connection::connect_to_env() else {
+                    tracing::warn!("thumbnail backend: no wayland connection");
+                    std::future::pending::<()>().await;
+                    unreachable!();
+                };
+                let mut receiver = start(conn);
+                while let Some(event) = receiver.next().await {
+                    let _ = output.send(event).await;
+                }
+            },
+        )
+    })
 }
 
 struct AppData {
