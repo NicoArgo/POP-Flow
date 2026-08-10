@@ -441,18 +441,33 @@ fn start(conn: Connection) -> mpsc::UnboundedReceiver<Event> {
         let (cmd_sender, cmd_channel) = calloop::channel::channel();
         app_data.send_event(Event::Ready(cmd_sender));
 
-        let mut event_loop = calloop::EventLoop::try_new().unwrap();
-        calloop_wayland_source::WaylandSource::new(conn, event_queue)
-            .insert(event_loop.handle())
-            .unwrap();
-        event_loop
+        // Same shape as the failures above: log and leave. A panic here would
+        // take the thread down mid-setup and the switcher would simply have no
+        // thumbnails, with nothing in the log saying why.
+        let mut event_loop = match calloop::EventLoop::try_new() {
+            Ok(event_loop) => event_loop,
+            Err(err) => {
+                tracing::error!("thumbnail backend: event loop unavailable: {err}");
+                return;
+            }
+        };
+        if let Err(err) =
+            calloop_wayland_source::WaylandSource::new(conn, event_queue).insert(event_loop.handle())
+        {
+            tracing::error!("thumbnail backend: could not watch the wayland socket: {err}");
+            return;
+        }
+        if let Err(err) = event_loop
             .handle()
             .insert_source(cmd_channel, |event, _, app_data| {
                 if let calloop::channel::Event::Msg(msg) = event {
                     app_data.handle_cmd(msg);
                 }
             })
-            .unwrap();
+        {
+            tracing::error!("thumbnail backend: could not watch the command channel: {err}");
+            return;
+        }
 
         loop {
             if event_loop.dispatch(None, &mut app_data).is_err() {
