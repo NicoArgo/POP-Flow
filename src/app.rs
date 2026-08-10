@@ -49,7 +49,7 @@ use iced::keyboard::{Key, Modifiers};
 use iced::{Alignment, Color};
 use pop_launcher::{GpuPreference, IconSource, SearchResult};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
 // POP Flow: `PathBuf` for the context menu's file-path extraction.
 use std::path::{Path, PathBuf};
@@ -205,6 +205,19 @@ pub struct CosmicLauncher {
     last_hide: Instant,
     alt_tab: bool,
     alt_tab_released: bool,
+    /// Fixed cell order for the alt-tab grid: window ids (wayland toplevel
+    /// protocol ids) in the order their thumbnails are drawn. Survives across
+    /// alt-tab sessions, so activating a window never moves its thumbnail to
+    /// the front — new windows are appended, closed ones drop out.
+    window_order: Vec<u32>,
+    /// Window ids, most recently used first, as reported by pop-launcher. The
+    /// grid no longer follows this order, but alt-tab still needs it to open
+    /// with the previously used window highlighted.
+    mru: Vec<u32>,
+    /// Set while an alt-tab session has not picked its first target yet. With
+    /// a fixed grid the first Tab can't just step one cell forward: it has to
+    /// jump to the previously used window, wherever that window sits.
+    alt_tab_fresh: bool,
     window_id: window::Id,
     queue: VecDeque<Message>,
     result_ids: Vec<Id>,
@@ -327,6 +340,9 @@ impl CosmicLauncher {
         self.focused = 0;
         self.alt_tab = false;
         self.alt_tab_released = false;
+        self.alt_tab_fresh = false;
+        // `window_order` deliberately survives hiding: it is what keeps every
+        // thumbnail in the same cell from one alt-tab to the next.
         self.queue.clear();
         self.hand_over.clear();
         self.set_thumbs_active(false);
@@ -360,6 +376,30 @@ impl CosmicLauncher {
             return;
         }
         self.focused = (self.focused + self.launcher_items.len() - 1) % self.launcher_items.len();
+    }
+
+    /// Where the highlight lands when the alt-tab overlay opens. The grid keeps
+    /// a fixed cell order, so "the next window" is no longer the next cell: a
+    /// plain Alt+Tab must still land on the window used before the current one
+    /// (`mru[1]`, since `mru[0]` is the window alt-tab was pressed from) and
+    /// Shift+Alt+Tab on the least recently used one, wherever they sit in the
+    /// grid. Every Tab after this one walks the grid by position.
+    fn focus_initial(&mut self, backwards: bool) {
+        let target = if backwards {
+            self.mru.last().copied()
+        } else {
+            self.mru.get(1).copied()
+        };
+        let Some(target) = target else {
+            return;
+        };
+        if let Some(i) = self
+            .launcher_items
+            .iter()
+            .position(|item| window_key(item) == Some(target))
+        {
+            self.focused = i;
+        }
     }
 
     fn handle_overlap(&mut self) -> Task<Message> {
@@ -779,6 +819,42 @@ fn assign_thumbs(items: &[SearchResult], thumbs: &[ThumbEntry]) -> Vec<Option<us
         .collect()
 }
 
+/// Stable identity of a window result: the wayland toplevel protocol id, which
+/// pop-launcher passes through untouched and which lives as long as the window
+/// does. `SearchResult::id` cannot be used for this — it is just the item's
+/// index in the current response and changes on every search.
+fn window_key(item: &SearchResult) -> Option<u32> {
+    item.window.map(|(_, id)| id)
+}
+
+/// Fold a fresh result list into the remembered grid order: windows that are
+/// gone drop out, windows never seen before are appended at the end (in the
+/// order the list reports them). Windows already known keep their slot, which
+/// is what stops an activated window from jumping to the first cell.
+fn sync_window_order(order: &mut Vec<u32>, items: &[SearchResult]) {
+    let present: HashSet<u32> = items.iter().filter_map(window_key).collect();
+    order.retain(|id| present.contains(id));
+    for id in items.iter().filter_map(window_key) {
+        if !order.contains(&id) {
+            order.push(id);
+        }
+    }
+}
+
+/// Reorder results into the remembered grid order (see [`sync_window_order`]),
+/// keeping window items ahead of non-window ones. Windows missing from `order`
+/// sort last, so a list that has not been synced yet still renders.
+fn apply_window_order(items: &mut [SearchResult], order: &[u32]) {
+    items.sort_by_key(|item| {
+        (
+            i32::from(item.window.is_none()),
+            window_key(item)
+                .and_then(|id| order.iter().position(|o| *o == id))
+                .unwrap_or(usize::MAX),
+        )
+    });
+}
+
 /// Grouping key for clustering windows of the same application: the item's app
 /// hint (from its icon / app id) when available, else its lowercased display
 /// name. Windows of one app share a key and are drawn next to each other.
@@ -982,6 +1058,9 @@ impl cosmic::Application for CosmicLauncher {
             last_hide: Instant::now(),
             alt_tab: false,
             alt_tab_released: false,
+            window_order: Vec::new(),
+            mru: Vec::new(),
+            alt_tab_fresh: false,
             window_id: SurfaceId::unique(),
             queue: VecDeque::new(),
             result_ids: (0..10)
@@ -1215,9 +1294,21 @@ impl cosmic::Application for CosmicLauncher {
                         if self.alt_tab && list.is_empty() {
                             return self.hide();
                         }
-                        if self.alt_tab || self.input_value.is_empty() {
-                            // Window-list views (alt-tab, empty launcher): most
-                            // recent first, then cluster same-app windows.
+                        if self.alt_tab {
+                            // Alt-tab grid: fixed cells. pop-launcher reports
+                            // windows least-recently-used first and moves a
+                            // window to the end whenever it is activated, so
+                            // following that order would make a thumbnail jump
+                            // to the first cell after every use. Remember the
+                            // MRU for the initial highlight only, and draw the
+                            // grid in the remembered order instead.
+                            self.mru = list.iter().rev().filter_map(window_key).collect();
+                            sync_window_order(&mut self.window_order, &list);
+                            apply_window_order(&mut list, &self.window_order);
+                            group_by_app(&mut list);
+                        } else if self.input_value.is_empty() {
+                            // Empty launcher list: most recent first (so Enter
+                            // hits the last window), then cluster same-app ones.
                             list.reverse();
                             group_by_app(&mut list);
                         } else {
@@ -1413,7 +1504,11 @@ impl cosmic::Application for CosmicLauncher {
                 });
             }
             Message::AltTab => {
-                self.focus_next();
+                if std::mem::take(&mut self.alt_tab_fresh) {
+                    self.focus_initial(false);
+                } else {
+                    self.focus_next();
+                }
                 return operation::snap_to(
                     SCROLLABLE.clone(),
                     RelativeOffset {
@@ -1426,7 +1521,11 @@ impl cosmic::Application for CosmicLauncher {
                 );
             }
             Message::ShiftAltTab => {
-                self.focus_previous();
+                if std::mem::take(&mut self.alt_tab_fresh) {
+                    self.focus_initial(true);
+                } else {
+                    self.focus_previous();
+                }
                 return operation::snap_to(
                     SCROLLABLE.clone(),
                     RelativeOffset {
@@ -1562,6 +1661,7 @@ impl cosmic::Application for CosmicLauncher {
                         }
 
                         self.alt_tab = true;
+                        self.alt_tab_fresh = true;
                         self.set_thumbs_active(true);
                         self.alt_tab_released = false;
                         self.request(launcher::Request::Search(String::new()));
@@ -1579,6 +1679,7 @@ impl cosmic::Application for CosmicLauncher {
                         }
 
                         self.alt_tab = true;
+                        self.alt_tab_fresh = true;
                         self.set_thumbs_active(true);
                         self.alt_tab_released = false;
                         self.request(launcher::Request::Search(String::new()));
@@ -2077,6 +2178,80 @@ mod tests {
         ];
         group_by_app(&mut list);
         assert_eq!(ids(&list), vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn window_order_survives_activation() {
+        // The grid is drawn once...
+        let mut order = Vec::new();
+        let mut list = vec![
+            item(1, "Term", "A", Some("term"), true),
+            item(2, "Firefox", "B", Some("firefox"), true),
+            item(3, "Code", "C", Some("code"), true),
+        ];
+        sync_window_order(&mut order, &list);
+        apply_window_order(&mut list, &order);
+        assert_eq!(ids(&list), vec![1, 2, 3]);
+
+        // ...then Code is activated, so pop-launcher now reports it last (its
+        // MRU order) and re-numbers every item. The cells must not move.
+        let mut list = vec![
+            item(0, "Term", "A", Some("term"), true),
+            item(1, "Firefox", "B", Some("firefox"), true),
+            item(2, "Code", "C", Some("code"), true),
+        ];
+        list[0].window = Some((0, 1));
+        list[1].window = Some((0, 2));
+        list[2].window = Some((0, 3));
+        list.reverse(); // MRU-first, as the old code drew it
+        sync_window_order(&mut order, &list);
+        apply_window_order(&mut list, &order);
+        assert_eq!(
+            list.iter().filter_map(window_key).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "an activated window must keep its cell"
+        );
+    }
+
+    #[test]
+    fn window_order_appends_new_and_drops_closed() {
+        let mut order = Vec::new();
+        sync_window_order(
+            &mut order,
+            &[
+                item(1, "Term", "A", Some("term"), true),
+                item(2, "Firefox", "B", Some("firefox"), true),
+            ],
+        );
+        // A third window opens: it goes to the end, it does not push the others.
+        sync_window_order(
+            &mut order,
+            &[
+                item(1, "Term", "A", Some("term"), true),
+                item(2, "Firefox", "B", Some("firefox"), true),
+                item(3, "Code", "C", Some("code"), true),
+            ],
+        );
+        assert_eq!(order, vec![1, 2, 3]);
+        // Firefox closes: it drops out, the rest keep their relative order.
+        sync_window_order(
+            &mut order,
+            &[
+                item(1, "Term", "A", Some("term"), true),
+                item(3, "Code", "C", Some("code"), true),
+            ],
+        );
+        assert_eq!(order, vec![1, 3]);
+    }
+
+    #[test]
+    fn window_order_keeps_non_windows_last() {
+        let mut list = vec![
+            item(1, "Calculator", "run", Some("calc"), false),
+            item(2, "Term", "A", Some("term"), true),
+        ];
+        apply_window_order(&mut list, &[2]);
+        assert_eq!(ids(&list), vec![2, 1]);
     }
 
     #[test]

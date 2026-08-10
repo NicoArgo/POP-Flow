@@ -16,6 +16,10 @@ touched — the compositor is left completely alone.
   (screencopy) protocol — the real contents of each window, snapshotted (and
   downscaled) each time the switcher opens.
 - ▦ **Two-column grid** layout, thumbnail-first.
+- 📌 **Fixed cells** — a window keeps the same spot in the grid instead of jumping
+  to the front every time you switch to it, so you can reach it by muscle memory.
+  New windows are appended at the end; Alt-Tab still opens with the previously
+  used window highlighted, wherever it sits.
 - 🔲 **Rounded thumbnail corners** (anti-aliased alpha mask).
 - 🏷️ **Clean by default** — the window title is hidden and only appears on the
   **selected** or **hovered** thumbnail.
