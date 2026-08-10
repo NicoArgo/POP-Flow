@@ -12,6 +12,7 @@ cd "$(dirname "$0")"
 
 # --- component-specific settings ------------------------------------------
 COMP=cosmic-launcher                      # name under /usr/bin
+PKG=cosmic-launcher                       # package that owns /usr/bin/$COMP
 BUILT="target/release/cosmic-launcher"    # our build
 RELOAD='pkill -x cosmic-launcher 2>/dev/null || true'   # reload after reapply
 # --------------------------------------------------------------------------
@@ -36,7 +37,12 @@ sudo tee "$REAPPLY" >/dev/null <<EOS
 set -e
 GOLDEN=$GOLDEN
 TARGET=/usr/bin/$COMP
+PKG=$PKG
 [ -f "\$GOLDEN" ] || exit 0
+# Survive an update, not a removal. With the package gone the user asked
+# for this program to be gone, and putting the binary back would leave a
+# file no package owns.
+dpkg-query -W -f='\${Status}' "\$PKG" 2>/dev/null | grep -q '^install ok installed$' || exit 0
 if [ ! -f "\$TARGET" ] || [ -L "\$TARGET" ] || ! cmp -s "\$GOLDEN" "\$TARGET"; then
     install -m 0755 -o root -g root "\$GOLDEN" "\$TARGET"
     command -v logger >/dev/null 2>&1 && logger -t pop-flow "reapplied $COMP after change"

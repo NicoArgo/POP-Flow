@@ -5,14 +5,12 @@ cd "$(dirname "$0")"
 
 [ -f cosmic-launcher.orig ] || { echo "No backup (cosmic-launcher.orig) found."; exit 1; }
 
-# Turn off auto-reapply first, or the next package op would re-patch the binary
-# right after we restore the original.
-if [ -f /etc/apt/apt.conf.d/99-pop-flow-cosmic-launcher ]; then
-    echo "==> Removing auto-reapply hook (needs sudo)..."
-    sudo rm -f /etc/apt/apt.conf.d/99-pop-flow-cosmic-launcher \
-               /usr/local/lib/pop-flow/reapply-cosmic-launcher \
-               /usr/local/lib/pop-flow/cosmic-launcher
-    sudo rmdir --ignore-fail-on-non-empty /usr/local/lib/pop-flow 2>/dev/null || true
+# Turn off auto-reapply first, or the next package operation would re-patch the
+# binary right after we restore the original. Delegating to the script that owns
+# those paths rather than repeating them: this used to remove only the golden
+# copy, leaving a root-owned APT hook behind for good.
+if [ -x ./remove-auto-reapply.sh ]; then
+    ./remove-auto-reapply.sh
 fi
 
 echo "==> Restoring original /usr/bin/cosmic-launcher (needs sudo)..."
