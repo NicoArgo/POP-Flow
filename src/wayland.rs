@@ -235,6 +235,7 @@ impl ScreencopyHandler for AppData {
                 identifier,
                 title,
                 app_id,
+                buffer: buffer.clone(),
                 pool: Mutex::new(pool),
                 size: (width, height),
             },
@@ -376,8 +377,24 @@ struct FrameData {
     identifier: String,
     title: String,
     app_id: String,
+    /// The buffer the snapshot is written into. Ours to destroy: see `Drop`.
+    buffer: wl_buffer::WlBuffer,
     pool: Mutex<RawPool>,
     size: (u32, u32),
+}
+
+impl Drop for FrameData {
+    fn drop(&mut self) {
+        // `RawPool` destroys the pool and closes our copy of the memfd, but a
+        // pool being destroyed does not invalidate the buffers made from it:
+        // the compositor keeps the shared memory alive for as long as any of
+        // them exists. Leaving the buffer behind therefore keeps a
+        // window-sized allocation mapped in the compositor for the rest of the
+        // session — one per window, every time the switcher opens — while no
+        // process shows an fd for it. Destroying it here is what actually
+        // hands the memory back.
+        self.buffer.destroy();
+    }
 }
 
 impl ScreencopyFrameDataExt for FrameData {
