@@ -958,23 +958,51 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Extract an existing filesystem path from a search result, if it looks like
-/// one. File/folder results carry the absolute path in the description (or the
-/// name); a leading `~` is expanded. Returns `None` for windows and for text
-/// that doesn't resolve to something on disk, so apps don't get file actions.
-fn result_path(item: &SearchResult) -> Option<PathBuf> {
-    if item.window.is_some() {
-        return None;
-    }
-    for raw in [item.description.as_str(), item.name.as_str()] {
-        let raw = raw.trim();
-        let candidate = if let Some(rest) = raw.strip_prefix("~/") {
-            match std::env::var_os("HOME") {
-                Some(home) => Path::new(&home).join(rest),
-                None => continue,
+/// Decode `%XX` escapes. pop-launcher hands back names and URIs straight from
+/// the recent-documents store, where they are percent-encoded — a folder called
+/// "Área de trabalho" arrives as "%C3%81rea de trabalho", which matches nothing
+/// on disk until it is decoded.
+///
+/// Returns `None` when the input is not valid UTF-8 once decoded, so a mangled
+/// name falls through to being treated as literal text rather than becoming a
+/// wrong path.
+fn percent_decode(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+            match u8::from_str_radix(hex, 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+                // A stray `%` that isn't an escape is just a character.
+                Err(_) => {}
             }
-        } else if raw.starts_with('/') {
-            PathBuf::from(raw)
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Turn one piece of text into a path, if it resolves to something on disk.
+/// Handles the three shapes pop-launcher's plugins actually produce: a
+/// `file://` URI (the recent-documents plugin), a `~/`-relative path, and an
+/// absolute one.
+fn path_from_text(raw: &str) -> Option<PathBuf> {
+    let raw = raw.trim();
+    let raw = raw.strip_prefix("file://").unwrap_or(raw);
+    // Decode first, then fall back to the literal text: a name containing a
+    // real `%` is rare, but it should not stop the path from resolving.
+    for text in [percent_decode(raw), Some(raw.to_string())].into_iter().flatten() {
+        let candidate = if let Some(rest) = text.strip_prefix("~/") {
+            PathBuf::from(std::env::var_os("HOME")?).join(rest)
+        } else if text.starts_with('/') {
+            PathBuf::from(text)
         } else {
             continue;
         };
@@ -985,12 +1013,51 @@ fn result_path(item: &SearchResult) -> Option<PathBuf> {
     None
 }
 
+/// Extract an existing filesystem path from a search result, if it has one.
+///
+/// The plugins disagree about where the path lives, so this tries each place
+/// they actually use:
+///
+/// - the **recent-documents** plugin puts a `file://` URI in the description;
+/// - the **file navigation** plugin puts nothing usable anywhere — its
+///   description is the file's *size* ("12.00 KiB") and its name is the bare
+///   file name. That plugin only answers queries that are themselves paths
+///   (`~/Doc`), so the folder being listed is in `query`, and the result's name
+///   completes it. Without this the file actions never appeared at all for the
+///   plugin most likely to want them.
+///
+/// Returns `None` for windows and for anything that doesn't resolve on disk, so
+/// apps don't get file actions.
+fn result_path(item: &SearchResult, query: &str) -> Option<PathBuf> {
+    if item.window.is_some() {
+        return None;
+    }
+    if let Some(path) = path_from_text(&item.description).or_else(|| path_from_text(&item.name)) {
+        return Some(path);
+    }
+
+    // The query is a path being navigated: everything up to the last separator
+    // is the folder these results were listed from.
+    let query = query.trim();
+    if !(query.starts_with('/') || query.starts_with('~')) {
+        return None;
+    }
+    let dir = &query[..=query.rfind('/')?];
+    let name = percent_decode(item.name.trim()).unwrap_or_else(|| item.name.trim().to_string());
+    // A name is a single component by construction here; refuse anything else
+    // rather than let ".." walk out of the folder being listed.
+    if name.is_empty() || name.contains('/') || name == ".." {
+        return None;
+    }
+    path_from_text(&format!("{dir}{name}"))
+}
+
 /// Launcher-side context-menu rows for a result, shown above pop-launcher's own
 /// options. Keys off a filesystem path in the result (file/folder results
 /// expose one): "Open in terminal" at that location, "Open folder", "Copy path".
 /// Returns empty for results without a resolvable path (apps, windows).
-fn launcher_actions(item: &SearchResult) -> Vec<MenuEntry> {
-    let Some(path) = result_path(item) else {
+fn launcher_actions(item: &SearchResult, query: &str) -> Vec<MenuEntry> {
+    let Some(path) = result_path(item, query) else {
         return Vec::new();
     };
     // The directory to act on: the path itself when it's a folder, else its parent.
@@ -1217,7 +1284,7 @@ impl cosmic::Application for CosmicLauncher {
                             .launcher_items
                             .iter()
                             .find(|it| it.id == id)
-                            .map(launcher_actions)
+                            .map(|item| launcher_actions(item, &self.input_value))
                             .unwrap_or_default();
                         entries.extend(options.into_iter().map(|o| MenuEntry {
                             name: o.name,
@@ -2344,7 +2411,7 @@ mod tests {
     fn result_path_resolves_existing_abs_path() {
         // Root always exists and is a directory.
         assert_eq!(
-            result_path(&item(1, "root", "/", Some("folder"), false)),
+            result_path(&item(1, "root", "/", Some("folder"), false), ""),
             Some(PathBuf::from("/"))
         );
     }
@@ -2353,19 +2420,87 @@ mod tests {
     fn result_path_rejects_windows_and_non_paths() {
         // Plain app result: no filesystem path -> no file actions.
         assert_eq!(
-            result_path(&item(1, "Firefox", "Web Browser", Some("firefox"), false)),
+            result_path(&item(1, "Firefox", "Web Browser", Some("firefox"), false), ""),
             None
         );
         // A window result never gets file actions, even if its text looks pathy.
-        assert_eq!(result_path(&item(2, "Term", "/", Some("term"), true)), None);
+        assert_eq!(result_path(&item(2, "Term", "/", Some("term"), true), "/"), None);
+    }
+
+    #[test]
+    fn result_path_reads_the_recent_plugins_uri() {
+        // Verbatim shape of what `recent` returns: a file:// URI, percent-encoded,
+        // with literal spaces left in.
+        let tmp = std::env::temp_dir().join("pop flow ação.txt");
+        std::fs::write(&tmp, b"x").unwrap();
+        let uri = format!(
+            "file://{}/pop flow a%C3%A7%C3%A3o.txt",
+            std::env::temp_dir().display()
+        );
+        assert_eq!(
+            result_path(&item(1, "ação.txt", &uri, Some("text"), false), "recent ação"),
+            Some(tmp.clone())
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn result_path_completes_the_file_plugins_bare_name() {
+        // The file-navigation plugin gives the name only and puts the file's
+        // *size* in the description, so the folder has to come from the query.
+        let dir = std::env::temp_dir().join("pop-flow-result-path");
+        std::fs::create_dir_all(dir.join("Área de trabalho")).unwrap();
+        let query = format!("{}/", dir.display());
+
+        // Its names arrive percent-encoded, and the decoded one is what exists.
+        assert_eq!(
+            result_path(
+                &item(1, "%C3%81rea%20de%20trabalho", "4.00 KiB", Some("folder"), false),
+                &query
+            ),
+            Some(dir.join("Área de trabalho"))
+        );
+        // A name that does not exist in that folder resolves to nothing.
+        assert_eq!(
+            result_path(&item(2, "não-existe", "4.00 KiB", Some("folder"), false), &query),
+            None
+        );
+        // And the folder only comes from a query that is itself a path.
+        assert_eq!(
+            result_path(&item(3, "Área de trabalho", "4.00 KiB", Some("folder"), false), "firefox"),
+            None
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn result_path_refuses_to_walk_out_of_the_listed_folder() {
+        // `..` completes to a real directory, and acting on it would be acting
+        // somewhere the user never asked about.
+        assert_eq!(
+            result_path(&item(1, "..", "4.00 KiB", Some("folder"), false), "/usr/share/"),
+            None
+        );
+    }
+
+    #[test]
+    fn percent_decode_leaves_ordinary_text_alone() {
+        assert_eq!(percent_decode("Downloads").as_deref(), Some("Downloads"));
+        assert_eq!(percent_decode("100%").as_deref(), Some("100%"));
+        assert_eq!(
+            percent_decode("%C3%81rea%20de%20trabalho").as_deref(),
+            Some("Área de trabalho")
+        );
     }
 
     #[test]
     fn launcher_actions_offers_terminal_for_folders() {
-        let acts = launcher_actions(&item(1, "root", "/", Some("folder"), false));
+        let acts = launcher_actions(&item(1, "root", "/", Some("folder"), false), "");
         assert_eq!(acts.len(), 3);
         assert!(matches!(acts[0].action, MenuAction::OpenTerminal(_)));
         // Non-path results get no launcher-side actions.
-        assert!(launcher_actions(&item(2, "Firefox", "Web Browser", Some("ff"), false)).is_empty());
+        assert!(
+            launcher_actions(&item(2, "Firefox", "Web Browser", Some("ff"), false), "").is_empty()
+        );
     }
 }
