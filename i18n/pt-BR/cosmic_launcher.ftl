@@ -4,3 +4,4 @@ close-window = Fechar janela
 open-in-terminal = Abrir no terminal
 open-folder = Abrir pasta
 copy-path = Copiar caminho
+more-windows = +{ $count } janelas — continue apertando Tab

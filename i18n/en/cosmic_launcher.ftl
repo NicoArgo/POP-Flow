@@ -4,3 +4,4 @@ close-window = Close window
 open-in-terminal = Open in terminal
 open-folder = Open folder
 copy-path = Copy path
+more-windows = +{ $count } more — keep pressing Tab

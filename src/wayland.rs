@@ -482,7 +482,7 @@ fn start(conn: Connection) -> mpsc::UnboundedReceiver<Event> {
 /// Longest-side cap for stored thumbnails. The switcher draws them at ~264×156,
 /// so ~2× that is ample for HiDPI while keeping each handle a few hundred KB
 /// instead of tens of MB.
-const THUMB_MAX_DIM: u32 = 512;
+pub(crate) const THUMB_MAX_DIM: u32 = 512;
 
 /// Box-average downscale of an RGBA buffer so its longest side is at most
 /// `max_dim`, returning the input untouched when it already fits. Keeps the

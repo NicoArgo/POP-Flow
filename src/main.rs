@@ -2,6 +2,7 @@ mod components;
 #[rustfmt::skip]
 mod config;
 mod app;
+mod grid;
 mod localize;
 mod subscriptions;
 mod wayland;

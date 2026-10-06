@@ -1,6 +1,6 @@
 use crate::app::iced::event::listen_raw;
 use crate::subscriptions::launcher;
-use crate::{components, fl};
+use crate::{components, fl, grid};
 use clap::Parser;
 use cosmic::app::{Core, CosmicFlags, Settings, Task};
 use cosmic::cctk::sctk;
@@ -72,6 +72,8 @@ static SCROLLABLE: LazyLock<Id> = LazyLock::new(|| Id::new("scrollable"));
 
 pub(crate) static MENU_ID: LazyLock<SurfaceId> = LazyLock::new(SurfaceId::unique);
 const SCROLL_MIN: usize = 8;
+/// POP Flow: gap between alt-tab grid cells, both directions.
+const GRID_SPACING: f32 = 8.0;
 
 #[derive(Parser, Debug, Serialize, Deserialize, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -229,6 +231,8 @@ pub struct CosmicLauncher {
     /// its thumbnails to fit rather than scrolling. `None` until the first output
     /// event arrives, in which case the grid falls back to a sane default size.
     screen_size: Option<(f32, f32)>,
+    /// Scale factor of that output (physical / logical), 1.0 until known.
+    screen_scale: f32,
     needs_clear: bool,
     hand_over: String,
     dummy_id: Option<window::Id>,
@@ -510,29 +514,25 @@ impl CosmicLauncher {
 
     /// The Windows-style thumbnail grid shown while alt-tab is active.
     fn alt_tab_view(&self) -> Element<'_, Message> {
-        // Base thumbnail size; the grid scales this down (never up past 1.0) so
-        // every window fits on screen at once, no scrolling.
-        const THUMB_W: f32 = 264.0;
-        const THUMB_H: f32 = 156.0;
-        // Reserve one caption line under every thumbnail so revealing the title
-        // on focus/hover doesn't grow the cell and reflow the whole grid. Kept at
-        // a fixed, readable height even as the thumbnails shrink.
-        const LABEL_H: f32 = 20.0;
-
-        // Fit the whole grid inside the current output: pick a column count and a
-        // thumbnail scale so nothing overflows and no scrollbar is needed. Falls
-        // back to a sane default screen size until the first output event lands.
+        // Fit the whole grid inside the current output (see `crate::grid` for
+        // the sizing rules). Falls back to a sane default screen size until the
+        // first output event lands.
         let (screen_w, screen_h) = self.screen_size.unwrap_or((1920.0, 1080.0));
-        let avail_w = (screen_w - 64.0).max(THUMB_W + 24.0);
-        let avail_h = (screen_h - self.margin - 112.0).max(THUMB_H + 60.0);
-        let (cols, scale) = grid_layout(self.launcher_items.len(), avail_w, avail_h);
-
-        let thumb_w = THUMB_W * scale;
-        let thumb_h = THUMB_H * scale;
+        let (avail_w, avail_h) = grid::available_area(screen_w, screen_h, self.margin);
+        let layout = grid::layout(grid::GridInput {
+            count: self.launcher_items.len(),
+            avail_w,
+            avail_h,
+            scale_factor: self.screen_scale,
+            spacing: GRID_SPACING,
+        });
+                let (thumb_w, thumb_h) = (layout.thumb_w, layout.thumb_h);
+        let scale = thumb_w / grid::BASE_W;
         let icon_sz = 56.0 * scale;
         let close_icon = (16.0 * scale).round().max(11.0) as u16;
         // Caption chars that fit the (possibly narrowed) thumbnail width.
         let title_cap = ((thumb_w / 7.5) as usize).max(6);
+        let cols = layout.cols;
 
         // 1:1 image assignment so two same-title windows never share a picture.
         let thumb_assign = self.assign_thumbnails();
@@ -623,17 +623,17 @@ impl CosmicLauncher {
                     horizontal_space().width(Length::Fixed(0.0)).into()
                 })
                 .width(Length::Fixed(thumb_w))
-                .height(Length::Fixed(LABEL_H))
+                .height(Length::Fixed(grid::LABEL_H))
                 .align_x(Horizontal::Center)
                 .align_y(Vertical::Center)
                 .into();
 
-                let cell = column![media, label].spacing(6).align_x(Alignment::Center);
+                let cell = column![media, label].spacing(grid::LABEL_GAP).align_x(Alignment::Center);
 
                 let btn = cosmic::widget::button::custom(cell)
                     .id(self.result_ids[i].clone())
                     .on_press(Message::Activate(Some(i)))
-                    .padding(6)
+                    .padding(grid::CELL_PAD)
                     .class(Button::Custom {
                         active: Box::new(move |focused, theme| {
                             let focused = is_focused || focused;
@@ -688,23 +688,39 @@ impl CosmicLauncher {
             .collect();
 
         // Lay cells out `cols` per row, padding the final row with spacers so the
-        // grid stays aligned. No scrollbar — `grid_layout` already sized every
-        // thumbnail so the whole grid fits the screen.
-        let mut grid = Column::new().spacing(8);
-        let mut iter = cells.into_iter().peekable();
+        // grid stays aligned. No scrollbar: `grid::layout` sized every thumbnail
+        // so the grid fits the screen. Past the minimum size only
+        // `visible_rows` rows are drawn — the page holding the focused cell —
+        // plus a hint line counting the windows on other pages.
+        let first_row = layout.first_visible_row(self.focused);
+        let shown = first_row * cols..((first_row + layout.visible_rows) * cols).min(cells.len());
+        let hidden = cells.len() - shown.len();
+        let mut grid_col = Column::new().spacing(GRID_SPACING);
+        let mut iter = cells.into_iter().skip(shown.start).take(shown.len()).peekable();
         while iter.peek().is_some() {
             let mut children: Vec<Element<Message>> = Vec::with_capacity(cols);
             for _ in 0..cols {
                 match iter.next() {
                     Some(cell) => children.push(cell),
                     None => children
-                        .push(horizontal_space().width(Length::Fixed(thumb_w + 12.0)).into()),
+                        .push(horizontal_space().width(Length::Fixed(layout.cell_w())).into()),
                 }
             }
-            grid = grid.push(Row::with_children(children).spacing(8));
+            grid_col = grid_col.push(Row::with_children(children).spacing(GRID_SPACING));
+        }
+        if layout.paged() {
+            grid_col = grid_col.push(
+                container(text::caption(fl!("more-windows", count = hidden)))
+                    // Fixed, not Fill: a Fill child would stretch the
+                    // shrink-wrapped overlay to its 8000 px width cap.
+                    .width(Length::Fixed(layout.size(GRID_SPACING).0))
+                    .height(Length::Fixed(grid::HINT_H - GRID_SPACING))
+                    .align_x(Horizontal::Center)
+                    .align_y(Vertical::Center),
+            );
         }
 
-        let body: Element<Message> = grid.into();
+        let body: Element<Message> = grid_col.into();
 
         let window = Column::new()
             .push(vertical_space().height(Length::Fixed(self.margin + 16.)))
@@ -881,45 +897,6 @@ fn group_by_app(items: &mut [SearchResult]) {
             rank.get(&group_key(item)).copied().unwrap_or(usize::MAX),
         )
     });
-}
-
-/// Choose how many columns the alt-tab grid uses and how much to scale its
-/// thumbnails so all `n` cells fit inside `avail_w` x `avail_h` without
-/// scrolling. Tries every column count and keeps the one that yields the
-/// largest thumbnails; the scale is capped at 1.0 (never upscaled past the
-/// captured size) and floored at `MIN_SCALE` (past which the grid may exceed
-/// the screen rather than render unreadably tiny thumbnails). The caption line
-/// and per-cell padding are treated as fixed (unscaled) chrome so labels stay
-/// legible as the images shrink. Returns `(columns, scale)`.
-fn grid_layout(n: usize, avail_w: f32, avail_h: f32) -> (usize, f32) {
-    const THUMB_W: f32 = 264.0;
-    const THUMB_H: f32 = 156.0;
-    // Fixed chrome per cell: height = caption + inner spacing + button padding;
-    // width = button padding only.
-    const CELL_FIXED_H: f32 = 38.0;
-    const CELL_FIXED_W: f32 = 12.0;
-    const GAP: f32 = 8.0;
-    const MIN_SCALE: f32 = 0.30;
-
-    if n == 0 {
-        return (1, 1.0);
-    }
-
-    let (mut best_cols, mut best_scale) = (1usize, 0.0f32);
-    for cols in 1..=n {
-        let rows = n.div_ceil(cols);
-        let (colsf, rowsf) = (cols as f32, rows as f32);
-        let row_fixed = colsf * CELL_FIXED_W + (colsf - 1.0) * GAP;
-        let col_fixed = rowsf * CELL_FIXED_H + (rowsf - 1.0) * GAP;
-        let s_w = (avail_w - row_fixed) / (colsf * THUMB_W);
-        let s_h = (avail_h - col_fixed) / (rowsf * THUMB_H);
-        let s = s_w.min(s_h).min(1.0);
-        if s > best_scale {
-            best_scale = s;
-            best_cols = cols;
-        }
-    }
-    (best_cols, best_scale.max(MIN_SCALE))
 }
 
 fn alt_tab_modifier_is_released(modifiers: Modifiers) -> bool {
@@ -1137,6 +1114,7 @@ impl cosmic::Application for CosmicLauncher {
             overlap: HashMap::new(),
             height: 800.,
             screen_size: None,
+            screen_scale: 1.0,
             needs_clear: false,
             hand_over: String::default(),
             dummy_id: None,
@@ -1477,6 +1455,17 @@ impl cosmic::Application for CosmicLauncher {
                     && h > 1
                 {
                     self.screen_size = Some((w as f32, h as f32));
+                    // Fractional scales (1.25) only show up as physical mode
+                    // size over logical size; the integer `scale_factor` is
+                    // the fallback. Longest sides, so rotation doesn't matter.
+                    let logical = w.max(h) as f32;
+                    self.screen_scale = info
+                        .modes
+                        .iter()
+                        .find(|m| m.current)
+                        .map(|m| m.dimensions.0.max(m.dimensions.1) as f32 / logical)
+                        .filter(|s| s.is_finite() && *s > 0.0)
+                        .unwrap_or(info.scale_factor.max(1) as f32);
                 }
 
                 if matches!(event, OutputEvent::Created(_) | OutputEvent::InfoUpdate(_))
@@ -2356,48 +2345,6 @@ mod tests {
         ];
         let thumbs = vec![thumb("id", "Something Else", "org.x.y")];
         assert_eq!(assign_thumbs(&items, &thumbs), vec![None, None]);
-    }
-
-    #[test]
-    fn grid_layout_keeps_full_size_for_few_windows() {
-        // A handful of windows on a big screen never upscale past 1.0.
-        let (_cols, scale) = grid_layout(4, 1920.0 - 64.0, 1080.0 - 112.0);
-        assert_eq!(scale, 1.0);
-    }
-
-    #[test]
-    fn grid_layout_scales_down_when_crowded() {
-        // 30 windows on a small laptop screen can't fit at full size, so the
-        // thumbnails must shrink instead of scrolling.
-        let (cols, scale) = grid_layout(30, 1366.0 - 64.0, 768.0 - 112.0);
-        assert!(cols >= 3, "expected a multi-column grid, got {cols}");
-        assert!(scale < 1.0, "thumbnails should shrink, got {scale}");
-        assert!(scale >= 0.30, "scale must not drop below the floor, got {scale}");
-    }
-
-    #[test]
-    fn grid_layout_handles_zero() {
-        assert_eq!(grid_layout(0, 1000.0, 1000.0), (1, 1.0));
-    }
-
-    #[test]
-    fn grid_layout_result_fits_the_budget() {
-        // For any count, the chosen layout must actually fit within the budget
-        // (except when the scale hits its floor, where slight overflow is
-        // accepted over unreadable thumbnails).
-        const THUMB_W: f32 = 264.0;
-        const THUMB_H: f32 = 156.0;
-        let (aw, ah) = (1600.0f32, 900.0f32);
-        for n in 1..=30usize {
-            let (cols, scale) = grid_layout(n, aw, ah);
-            let rows = n.div_ceil(cols);
-            let w = cols as f32 * (THUMB_W * scale + 12.0) + (cols as f32 - 1.0) * 8.0;
-            let h = rows as f32 * (THUMB_H * scale + 38.0) + (rows as f32 - 1.0) * 8.0;
-            if scale > 0.30 {
-                assert!(w <= aw + 0.5, "n={n} cols={cols} width {w} > {aw}");
-                assert!(h <= ah + 0.5, "n={n} rows={rows} height {h} > {ah}");
-            }
-        }
     }
 
     #[test]
