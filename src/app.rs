@@ -678,12 +678,17 @@ impl CosmicLauncher {
                         }),
                     });
 
-                mouse_area(btn)
-                    .on_enter(Message::Hover(i))
-                    .on_exit(Message::Unhover)
-                    .on_right_release(Message::Context(i))
-                    .on_middle_release(Message::CloseWindow(i))
-                    .into()
+                // Peek: the focused cell lifts out of the grid, drawn scaled
+                // up above its neighbours. Layout-neutral, so cells stay fixed.
+                components::peek::peek(
+                    mouse_area(btn)
+                        .on_enter(Message::Hover(i))
+                        .on_exit(Message::Unhover)
+                        .on_right_release(Message::Context(i))
+                        .on_middle_release(Message::CloseWindow(i)),
+                    is_focused,
+                )
+                .into()
             })
             .collect();
 
