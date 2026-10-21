@@ -1042,18 +1042,27 @@ fn launcher_actions(item: &SearchResult, query: &str) -> Vec<MenuEntry> {
     let Some(path) = result_path(item, query) else {
         return Vec::new();
     };
-    // The directory to act on: the path itself when it's a folder, else its parent.
+    // The directory to act on: the path itself when it's a folder, else its
+    // parent.
     let dir = if path.is_dir() {
         path.clone()
     } else {
         path.parent().map_or_else(|| path.clone(), Path::to_path_buf)
     };
+    // "Open in terminal" on an executable opens its git repository's root, as
+    // in the file manager; "Open folder" stays the folder it's in.
+    let terminal_dir = if is_executable_file(&path) {
+        repo_root(&dir).unwrap_or_else(|| dir.clone())
+    } else {
+        dir.clone()
+    };
+    let terminal_dir = terminal_dir.to_string_lossy().into_owned();
     let dir = dir.to_string_lossy().into_owned();
     let full = path.to_string_lossy().into_owned();
     vec![
         MenuEntry {
             name: fl!("open-in-terminal"),
-            action: MenuAction::OpenTerminal(dir.clone()),
+            action: MenuAction::OpenTerminal(terminal_dir),
         },
         MenuEntry {
             name: fl!("open-folder"),
@@ -1064,6 +1073,18 @@ fn launcher_actions(item: &SearchResult, query: &str) -> Vec<MenuEntry> {
             action: MenuAction::CopyPath(full),
         },
     ]
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// The closest folder at or above `dir` holding `.git`.
+fn repo_root(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .find(|d| d.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 async fn try_get_gpu_envs(gpu: GpuPreference) -> Option<HashMap<String, String>> {
@@ -2454,5 +2475,29 @@ mod tests {
         assert!(
             launcher_actions(&item(2, "Firefox", "Web Browser", Some("ff"), false), "").is_empty()
         );
+    }
+
+    #[test]
+    fn launcher_actions_open_an_executables_repo_in_the_terminal() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("launcher-test-{}", std::process::id()));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("bin")).unwrap();
+        let bin = repo.join("bin/tool");
+        std::fs::write(&bin, "").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = bin.to_string_lossy().into_owned();
+        let acts = launcher_actions(&item(1, "tool", &path, None, false), "");
+        let MenuAction::OpenTerminal(dir) = &acts[0].action else {
+            panic!("no terminal action");
+        };
+        assert_eq!(dir, &repo.to_string_lossy());
+        // "Open folder" still opens the folder it's in.
+        let MenuAction::OpenFolder(folder) = &acts[1].action else {
+            panic!("no folder action");
+        };
+        assert_eq!(folder, &repo.join("bin").to_string_lossy());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
